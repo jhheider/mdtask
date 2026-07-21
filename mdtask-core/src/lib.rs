@@ -656,16 +656,6 @@ fn apply_line(
                 }
                 return;
             }
-            "dir" | "directory" => {
-                // Removed in v0.2. A task now runs in its file's directory by
-                // default; `Opts: inherit-cwd` opts into the invocation directory.
-                warnings.push(
-                    "`Dir:` was removed in v0.2; a task runs in its file's directory \
-                     by default. Use `Opts: inherit-cwd`, or `cd` in the script."
-                        .to_string(),
-                );
-                return;
-            }
             "args" | "arguments" => {
                 if let Some(t) = task {
                     t.args = parse_args(value);
@@ -965,12 +955,6 @@ mod tests {
         assert_eq!(tf.tasks[0].opts, vec!["inherit-cwd", "bogus"]);
         assert!(tf.tasks[0].inherits_cwd()); // the known flag still applies
         assert!(tf.warnings.iter().any(|w| w.contains("bogus")));
-    }
-
-    #[test]
-    fn a_leftover_dir_key_warns_about_the_v2_removal() {
-        let tf = parse("## t\n\nDir: sub/dir\n\n```sh\ntrue\n```\n");
-        assert!(tf.warnings.iter().any(|w| w.contains("`Dir:` was removed")));
     }
 
     // A `requires_of` for tests: a map from task name to its dependency names.
