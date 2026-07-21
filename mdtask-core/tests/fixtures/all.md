@@ -1,6 +1,6 @@
 # Project
 
-Intro prose under a section heading (no fence - so this is not a task).
+Intro prose under a section heading (no fence, so this is not a task).
 
 Env: SHARED=base
 
