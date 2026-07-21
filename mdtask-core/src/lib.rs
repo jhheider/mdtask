@@ -145,49 +145,107 @@ impl std::error::Error for DepError {}
 /// `requires_of`, which returns a task's declared dependency names, or `None` if
 /// the name is not a known task (so a typo in `Requires:` is a hard error, not a
 /// silent skip). Pure: no filesystem or process access.
+///
+/// The traversal is iterative (an explicit work stack, not native recursion), so a
+/// pathologically deep chain cannot overflow the call stack and abort the process.
 pub fn dependency_order(
     target: &str,
     requires_of: impl Fn(&str) -> Option<Vec<String>>,
 ) -> Result<Vec<String>, DepError> {
-    fn visit<F: Fn(&str) -> Option<Vec<String>>>(
-        name: &str,
-        required_by: &str,
-        requires_of: &F,
-        order: &mut Vec<String>,
-        done: &mut std::collections::BTreeSet<String>,
-        on_stack: &mut std::collections::BTreeSet<String>,
-    ) -> Result<(), DepError> {
-        if done.contains(name) {
-            return Ok(());
-        }
-        if !on_stack.insert(name.to_string()) {
-            return Err(DepError::Cycle(name.to_string()));
-        }
-        let deps = requires_of(name).ok_or_else(|| DepError::Missing {
-            task: name.to_string(),
-            required_by: required_by.to_string(),
-        })?;
-        for dep in &deps {
-            visit(dep, name, requires_of, order, done, on_stack)?;
-        }
-        on_stack.remove(name);
-        done.insert(name.to_string());
-        order.push(name.to_string());
-        Ok(())
+    // Each frame is a task whose dependencies we are still walking (`next` is the
+    // index of the next dependency to descend into). A post-order DFS: a frame
+    // moves to `order` only once all its dependencies are done.
+    struct Frame {
+        name: String,
+        deps: Vec<String>,
+        next: usize,
     }
 
     let mut order = Vec::new();
     let mut done = std::collections::BTreeSet::new();
     let mut on_stack = std::collections::BTreeSet::new();
-    visit(
-        target,
-        target,
-        &requires_of,
-        &mut order,
-        &mut done,
-        &mut on_stack,
-    )?;
+    let mut stack: Vec<Frame> = Vec::new();
+
+    let deps = requires_of(target).ok_or_else(|| DepError::Missing {
+        task: target.to_string(),
+        required_by: target.to_string(),
+    })?;
+    on_stack.insert(target.to_string());
+    stack.push(Frame {
+        name: target.to_string(),
+        deps,
+        next: 0,
+    });
+
+    loop {
+        // Decide the next move using a short-lived borrow of the top frame, so the
+        // stack is free to push/pop afterwards.
+        let descend = {
+            let Some(frame) = stack.last_mut() else { break };
+            if frame.next < frame.deps.len() {
+                let dep = frame.deps[frame.next].clone();
+                frame.next += 1;
+                Some(dep)
+            } else {
+                None
+            }
+        };
+        match descend {
+            Some(dep) => {
+                if done.contains(&dep) {
+                    continue; // already resolved via another path (a diamond)
+                }
+                if on_stack.contains(&dep) {
+                    return Err(DepError::Cycle(dep));
+                }
+                let required_by = stack.last().expect("a top frame exists").name.clone();
+                let deps = requires_of(&dep).ok_or(DepError::Missing {
+                    task: dep.clone(),
+                    required_by,
+                })?;
+                on_stack.insert(dep.clone());
+                stack.push(Frame {
+                    name: dep,
+                    deps,
+                    next: 0,
+                });
+            }
+            None => {
+                let frame = stack.pop().expect("a top frame exists");
+                on_stack.remove(&frame.name);
+                done.insert(frame.name.clone());
+                order.push(frame.name);
+            }
+        }
+    }
     Ok(order)
+}
+
+impl Task {
+    /// The declared argument names this task interpolates into its **script** via
+    /// `{{ arg }}` (raw text substitution, applied before the shell parses the
+    /// script). Because `{{ }}` is not shell-quoted, each of these is a shell
+    /// injection point for an untrusted argument value. A surface that runs a task
+    /// with caller-controlled argument values (an agent/MCP surface) should refuse
+    /// a task that has any, and the author should switch to `"$arg"`, which the
+    /// shell quotes. Empty for a task that only uses `$arg` (the safe form) or uses
+    /// `{{ }}` solely in `Dir:` (which is not the script). See [`TaskFile::invocation`].
+    pub fn script_arg_templates(&self) -> Vec<&str> {
+        let declared: std::collections::BTreeSet<&str> =
+            self.args.iter().map(|a| a.name.as_str()).collect();
+        let mut found: Vec<&str> = Vec::new();
+        let mut rest = self.script.as_str();
+        while let Some(open) = rest.find("{{") {
+            let after = &rest[open + 2..];
+            let Some(close) = after.find("}}") else { break };
+            let tok = after[..close].trim();
+            if declared.contains(tok) && !found.contains(&tok) {
+                found.push(tok);
+            }
+            rest = &after[close + 2..];
+        }
+        found
+    }
 }
 
 impl TaskFile {
@@ -919,6 +977,38 @@ mod tests {
                 required_by: "a".into(),
             })
         );
+    }
+
+    #[test]
+    fn dependency_order_survives_a_pathologically_deep_chain() {
+        // t0 -> t1 -> ... -> tN. Native recursion overflowed the stack here; the
+        // iterative walk must return a full, correctly ordered chain instead.
+        const N: usize = 200_000;
+        let order = dependency_order("t0", |n| {
+            let i: usize = n.strip_prefix('t')?.parse().ok()?;
+            Some(if i + 1 < N {
+                vec![format!("t{}", i + 1)]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        assert_eq!(order.len(), N);
+        assert_eq!(order.first().unwrap(), &format!("t{}", N - 1)); // deepest runs first
+        assert_eq!(order.last().unwrap(), "t0"); // target runs last
+    }
+
+    #[test]
+    fn script_arg_templates_flags_only_declared_args_in_the_script() {
+        // `name` is interpolated raw via {{ name }} (injectable); `safe` uses $safe.
+        let tf =
+            parse("## t\n\nArgs: name safe\n\n```sh\necho {{ name }} \"$safe\" {{ other }}\n```\n");
+        let t = tf.task("t").unwrap();
+        assert_eq!(t.script_arg_templates(), vec!["name"]);
+
+        // A task that only uses $arg has no raw template interpolation.
+        let safe = parse("## t\n\nArgs: name\n\n```sh\necho \"$name\"\n```\n");
+        assert!(safe.task("t").unwrap().script_arg_templates().is_empty());
     }
 
     #[test]

@@ -1,13 +1,22 @@
 //! `mdtask mcp`: a feature-gated MCP (Model Context Protocol) stdio server that
 //! exposes ONLY the agent-allowed tasks (`Agent: allow`) to an MCP client.
 //!
-//! Security model: fail closed. A task is invisible and unrunnable unless its
-//! nearest definition carries `Agent: allow`. `tools/list` enumerates only the
-//! allowed tasks, so the rest are not discoverable, and `run_task` re-checks the
-//! allowlist before running, so naming a hidden task fails too. A `Requires:`
-//! dependency of an allowed task still runs, since the author vouched for the
-//! whole task when they allowed it, but a dependency is never listed and never
-//! independently callable: the gate sits at the entry point the agent controls.
+//! Security model: fail closed.
+//!
+//! - A task is invisible and unrunnable unless its nearest definition carries
+//!   `Agent: allow`. `tools/list` enumerates only the allowed tasks, so the rest
+//!   are not discoverable, and `run_task` re-checks the allowlist before running,
+//!   so naming a hidden task fails too.
+//! - An allowed task's `Requires:` chain is resolved **within that task's own
+//!   file**, not by the global nearest-wins scan the CLI uses. The author who
+//!   wrote `Agent: allow` vouched for their file's tasks; a nearer, untrusted task
+//!   file in the invocation directory must not be able to shadow a dependency and
+//!   run attacker-controlled code through an allowed entry point. A dependency is
+//!   never listed and never independently callable.
+//! - A task that interpolates an argument into its **script** via `{{ arg }}` (raw,
+//!   unquoted substitution) is refused, since the agent controls the value: an
+//!   agent-run task must use `"$arg"`, which the shell quotes.
+//!
 //! Output is captured, not streamed, so the client receives it as tool-result
 //! text. The JSON-RPC loop is hand-rolled over serde_json (newline-delimited
 //! messages, the MCP stdio framing), with no SDK.
@@ -129,16 +138,6 @@ fn allowed(files: &[(PathBuf, TaskFile)]) -> Vec<(&Path, &TaskFile, &Task)> {
     out
 }
 
-/// The nearest definition of `name` across the layered files (the one that runs).
-fn nearest<'a>(
-    files: &'a [(PathBuf, TaskFile)],
-    name: &str,
-) -> Option<(&'a Path, &'a TaskFile, &'a Task)> {
-    files
-        .iter()
-        .find_map(|(p, tf)| tf.task(name).map(|t| (p.as_path(), tf, t)))
-}
-
 fn list_tasks_text(files: &[(PathBuf, TaskFile)]) -> String {
     let tasks = allowed(files);
     if tasks.is_empty() {
@@ -167,13 +166,36 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
     if name.is_empty() {
         return text_result("run_task requires a `name`".to_string(), true);
     }
-    // Fail closed: only the allowlist is runnable, and naming a hidden task fails.
-    if !allowed(files).iter().any(|(_, _, t)| t.name == name) {
+    // Fail closed: only an allowlisted task is runnable, and naming a hidden task
+    // fails. Capture the specific file that granted the allow, because the whole
+    // Requires: chain is resolved *within that file* below.
+    let Some((target_path, target_tf, target_task)) =
+        allowed(files).into_iter().find(|(_, _, t)| t.name == name)
+    else {
         return text_result(
             format!("task {name:?} is not available to agents (it lacks `Agent: allow`)"),
             true,
         );
+    };
+
+    // Refuse a task that interpolates an untrusted argument into its script via
+    // `{{ arg }}` (raw, unquoted text substitution: a shell injection point when
+    // the agent controls the value). Such a task must use `"$arg"` before it is
+    // safe to expose. Dependencies run argless with author-controlled defaults, so
+    // only the target, which receives the agent's `args`, is the injection surface.
+    let templated = target_task.script_arg_templates();
+    if !templated.is_empty() {
+        return text_result(
+            format!(
+                "task {name:?} interpolates argument(s) [{}] into its script via {{{{ }}}} \
+                 (raw and unquoted, a shell-injection risk with agent-supplied values); \
+                 it must use \"$arg\" before it can be run by an agent. Refused.",
+                templated.join(", ")
+            ),
+            true,
+        );
     }
+
     let positional: Vec<String> = arguments
         .get("args")
         .and_then(Value::as_array)
@@ -184,19 +206,25 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
         })
         .unwrap_or_default();
 
-    // Resolve the Requires: chain (deps first, target last), then run each with
-    // captured output. Dependencies run argless; only the target gets `args`.
+    // Resolve the Requires: chain **within the allowed task's own file** (not the
+    // global nearest-wins scan). This is the security boundary: the author who
+    // wrote `Agent: allow` vouched for that file's tasks, so a nearer, untrusted
+    // task file in the invocation directory cannot shadow a dependency and slip
+    // attacker-controlled code into an allowed task's run.
     let order = match mdtask_core::dependency_order(name, |n| {
-        nearest(files, n).map(|(_, _, t)| t.requires.clone())
+        target_tf.task(n).map(|t| t.requires.clone())
     }) {
         Ok(order) => order,
         Err(e) => return text_result(format!("{e}"), true),
     };
 
+    let task_file_dir = target_path.parent();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut out = String::new();
     for step in &order {
-        let (path, tf, task) = nearest(files, step).expect("a resolved name still exists");
+        let task = target_tf
+            .task(step)
+            .expect("a resolved name still exists in the target's file");
         let step_args: &[String] = if step == name { &positional } else { &[] };
         let values = match TaskFile::bind(task, step_args) {
             Ok(v) => v,
@@ -205,7 +233,7 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
                 return text_result(out, true);
             }
         };
-        let inv = match tf.invocation(task, &values, &cwd, path.parent()) {
+        let inv = match target_tf.invocation(task, &values, &cwd, task_file_dir) {
             Ok(inv) => inv,
             Err(e) => {
                 out.push_str(&format!("{e}\n"));
@@ -275,5 +303,47 @@ mod tests {
             ),
         ]);
         assert!(allowed(&f).is_empty());
+    }
+
+    fn call_text(res: &Value) -> String {
+        res["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn a_nearer_file_cannot_shadow_a_required_dependency_of_an_allowed_task() {
+        // The regression: a nearer, untrusted `build` must NOT run when the allowed
+        // ancestor `deploy` (which requires build) is invoked. The chain resolves
+        // within deploy's own file, so the ancestor's real build runs, not PWNED.
+        let f = files(&[
+            ("child/tasks.md", "## build\n\n```sh\necho PWNED\n```\n"),
+            (
+                "tasks.md",
+                "## deploy\n\nAgent: allow\nRequires: build\n\n```sh\necho real-deploy\n```\n\n## build\n\n```sh\necho real-build\n```\n",
+            ),
+        ]);
+        let res = run_task(&f, &json!({ "name": "deploy" }));
+        let text = call_text(&res);
+        assert!(text.contains("real-build"), "got: {text}");
+        assert!(text.contains("real-deploy"), "got: {text}");
+        assert!(!text.contains("PWNED"), "nearer build was executed: {text}");
+        assert_eq!(res["isError"], json!(false));
+    }
+
+    #[test]
+    fn a_task_that_injects_an_arg_via_double_brace_is_refused() {
+        // greet interpolates {{ name }} raw into its script; an agent-supplied
+        // value would be shell-injectable, so run_task must refuse before running.
+        let f = files(&[(
+            "tasks.md",
+            "## greet\n\nAgent: allow\nArgs: name\n\n```sh\necho hi {{ name }}\n```\n",
+        )]);
+        let res = run_task(&f, &json!({ "name": "greet", "args": ["x; echo PWNED"] }));
+        let text = call_text(&res);
+        assert_eq!(res["isError"], json!(true), "should be refused: {text}");
+        assert!(text.contains("Refused"), "got: {text}");
+        assert!(
+            !text.contains("PWNED"),
+            "the script must not have run: {text}"
+        );
     }
 }

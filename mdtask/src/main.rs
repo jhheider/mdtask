@@ -137,7 +137,13 @@ fn main() -> ExitCode {
             .status()
         {
             Ok(s) if s.success() => {}
-            Ok(s) => return ExitCode::from(s.code().unwrap_or(1) as u8),
+            // A failing child: surface a non-zero code. `code()` can exceed 255
+            // (Windows returns the full 32-bit code; POSIX has already masked to
+            // 8 bits), so clamp with `try_from` and never let it round to 0.
+            Ok(s) => {
+                let code = u8::try_from(s.code().unwrap_or(1)).unwrap_or(1).max(1);
+                return ExitCode::from(code);
+            }
             Err(e) => {
                 eprintln!("mdtask: could not run {}: {e}", inv.program);
                 return ExitCode::FAILURE;

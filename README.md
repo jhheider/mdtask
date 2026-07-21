@@ -135,10 +135,17 @@ invisible and unrunnable.
   discoverable.
 - `run_task` re-checks the allowlist before running, so naming a hidden task
   fails too. Its output is captured and returned as the tool result.
-- A `Requires:` dependency of an allowed task still runs (the author vouched for
-  the whole task when they wrote `Agent: allow`), but a dependency is never
-  listed and never independently callable: the gate is at the entry point the
-  agent controls, not every transitive step.
+- A `Requires:` dependency of an allowed task still runs, but is never listed and
+  never independently callable. Crucially, the chain is resolved **within the
+  allowed task's own file**, not by the global nearest-wins layering the CLI uses:
+  a nearer, untrusted `tasks.md` in the invocation directory **cannot** shadow a
+  dependency and run its own code through an allowed entry point. The author who
+  wrote `Agent: allow` vouched for their file's tasks, and only those run.
+- A task that interpolates an argument into its **script** via `{{ arg }}` is
+  **refused**: `{{ }}` is raw, unquoted substitution, so an agent-supplied value
+  would be shell-injectable. Expose such a task only after switching it to
+  `"$arg"`, which the shell quotes. (This applies to the target that receives the
+  agent's `args`; dependencies run with author-controlled defaults.)
 
 The `mcp` feature is off by default, so a plain build pulls no JSON or server
 dependencies.
