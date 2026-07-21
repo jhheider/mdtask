@@ -1,8 +1,9 @@
-//! `mdtask` - run tasks defined in markdown. A thin CLI over `mdtask-core`.
+//! `mdtask` runs tasks defined in markdown. It is a thin CLI over `mdtask-core`.
 //!
 //! ```text
 //! mdtask                 list tasks (walks up for tasks.md / maskfile.md / README.md)
 //! mdtask <name> [args...]  run a task; positional args fill its `Args:` in order
+//! mdtask lint [TASK]       shellcheck the shell scripts (all tasks, or one)
 //! mdtask -f FILE ...       use a specific task file (no directory walk)
 //! ```
 //!
@@ -10,13 +11,15 @@
 //! directory shadow those farther up, so a project inherits a baseline of tasks
 //! from its parents and overrides them where it wants.
 //!
-//! The library is the point; this is deliberately small (no arg-parser
-//! dependency).
+//! The library is the point, so this is deliberately small, with no arg-parser
+//! dependency.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mdtask_core::{Task, TaskFile};
+
+mod lint;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,6 +63,12 @@ fn main() -> ExitCode {
     let Some(name) = args.first().cloned() else {
         return list(&files);
     };
+
+    // `lint` is a reserved subcommand, checked before task dispatch. An optional
+    // second word restricts it to one task.
+    if name == "lint" {
+        return lint::run(&files, args.get(1).map(String::as_str));
+    }
 
     // Nearest file that defines the task wins (the fallback layering).
     let Some((path, tf, task)) = files

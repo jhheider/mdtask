@@ -68,7 +68,8 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
     let tf = parse(ALL);
 
     // greet: {{ name }} substituted; $greeting/$MOOD/$SHARED all in the env. Only
-    // `name` is supplied - `greeting` falls back to its default, `extra` is empty.
+    // `name` is supplied, so `greeting` falls back to its default and `extra` is
+    // empty.
     let greet = tf.task("greet").unwrap();
     let inv = tf
         .invocation(
@@ -79,8 +80,8 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
         )
         .unwrap();
     assert_eq!(inv.program, "sh");
-    // {{ name }}/{{ extra }} substituted; $greeting / $MOOD stay shell vars
-    // (resolved from the env at run time - the safe path for quoted values).
+    // {{ name }}/{{ extra }} substituted; $greeting / $MOOD stay shell vars,
+    // resolved from the env at run time (the safe path for quoted values).
     assert!(
         inv.args[1].contains("$greeting, sam ($MOOD) "),
         "got {:?}",
@@ -98,7 +99,7 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
             inv.env
         );
     }
-    // No Dir: -> the invocation directory, not where the task file lives.
+    // No Dir:, so the invocation directory, not where the task file lives.
     assert_eq!(inv.cwd, Path::new("/cwd"));
 
     // render: `Dir: .` pins to the task file's own directory.
