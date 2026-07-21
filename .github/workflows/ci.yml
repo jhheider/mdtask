@@ -1,10 +1,9 @@
 name: CI
 
-# Thin caller over jhheider/rust-ci. mdtask is PRIVATE while building, so CI
-# routes to the self-hosted arm64 runner (studio-mdtask). At the first public
-# release, revert to the default hosted matrix (drop os/runs-on, add
-# `coverage: true`), publish mdtask-core + mdtask, and remove the gha-runner
-# service. See README.
+# Thin caller over jhheider/rust-ci. mdtask is a Unix task runner: its execution
+# and MCP tests spawn `sh`/`bash`/`zsh`, so the test matrix is ubuntu + macos (no
+# windows, which has no POSIX shell). rust-ci defaults to `--all-features`, so this
+# also exercises the `mcp` feature.
 on:
   push:
     branches: [main]
@@ -20,6 +19,6 @@ jobs:
   ci:
     uses: jhheider/rust-ci/.github/workflows/ci.yml@v1
     with:
-      os: '["self-hosted"]'
-      runs-on: self-hosted
+      os: '["ubuntu-latest", "macos-latest"]'
+      coverage: true
     secrets: inherit

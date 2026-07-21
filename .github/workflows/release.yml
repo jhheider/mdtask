@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to rebuild binaries + refresh formula"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: jhheider/rust-ci/.github/workflows/release.yml@v1
+    with:
+      bin-name: mdtask
+      tag: ${{ github.event.inputs.tag }}
+      include-files: "README.md LICENSE-MIT LICENSE-APACHE"
+      features: mcp
+      publish-crates: true
+      crates: "mdtask-core mdtask"
+      tap-repo: jhheider/homebrew-tap
+      tap-formula: Formula/mdtask.rb
+      targets: |
+        {"include": [
+          {"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","asset":"mdtask-linux-x86_64.tar.gz"},
+          {"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","asset":"mdtask-linux-aarch64.tar.gz"},
+          {"os":"macos-latest","target":"x86_64-apple-darwin","asset":"mdtask-macos-x86_64.tar.gz"},
+          {"os":"macos-latest","target":"aarch64-apple-darwin","asset":"mdtask-macos-aarch64.tar.gz"},
+          {"os":"windows-latest","target":"x86_64-pc-windows-msvc","asset":"mdtask-windows-x86_64.zip"}
+        ]}
+    secrets: inherit
