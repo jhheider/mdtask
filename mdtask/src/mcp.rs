@@ -15,7 +15,8 @@
 //!   never listed and never independently callable.
 //! - A task that interpolates an argument into its **script** via `{{ arg }}` (raw,
 //!   unquoted substitution) is refused, since the agent controls the value: an
-//!   agent-run task must use `"$arg"`, which the shell quotes.
+//!   agent-run task must read the value from the environment (`"$arg"` in a
+//!   shell, `os.environ["arg"]` in Python, and so on), never template it.
 //!
 //! Output is captured, not streamed, so the client receives it as tool-result
 //! text. The JSON-RPC loop is hand-rolled over serde_json (newline-delimited
@@ -179,17 +180,18 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
     };
 
     // Refuse a task that interpolates an untrusted argument into its script via
-    // `{{ arg }}` (raw, unquoted text substitution: a shell injection point when
-    // the agent controls the value). Such a task must use `"$arg"` before it is
-    // safe to expose. Dependencies run argless with author-controlled defaults, so
-    // only the target, which receives the agent's `args`, is the injection surface.
+    // `{{ arg }}` (raw text substitution: an injection point when the agent
+    // controls the value). Such a task must read the value from the environment
+    // instead. Dependencies run argless with author-controlled defaults, so only
+    // the target, which receives the agent's `args`, is the injection surface.
     let templated = target_task.script_arg_templates();
     if !templated.is_empty() {
         return text_result(
             format!(
                 "task {name:?} interpolates argument(s) [{}] into its script via {{{{ }}}} \
-                 (raw and unquoted, a shell-injection risk with agent-supplied values); \
-                 it must use \"$arg\" before it can be run by an agent. Refused.",
+                 (raw substitution, an injection risk with agent-supplied values); it must \
+                 read them from the environment instead (\"$arg\", os.environ[\"arg\"], ...) \
+                 before an agent can run it. Refused.",
                 templated.join(", ")
             ),
             true,

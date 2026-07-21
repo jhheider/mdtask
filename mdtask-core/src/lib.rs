@@ -67,10 +67,12 @@ pub struct Task {
     /// required, `name='default'` is optional, and a trailing `*name` is variadic
     /// (it collects the rest, space-joined). Each one is substituted as
     /// `{{ name }}` in the script and also exported as `$name`. Note that
-    /// **`{{ name }}` is raw text substitution**, applied before the shell parses
-    /// the script, so `"{{ name }}"` is NOT injection-safe for untrusted values.
-    /// Prefer `"$name"`, which the shell quotes, and reserve `{{ }}` for
-    /// developer-authored templates.
+    /// **`{{ name }}` is raw text substitution**, spliced in before the interpreter
+    /// parses the script, so `{{ name }}` is NOT injection-safe for untrusted values
+    /// in any language. The safe form is to read the value from the environment,
+    /// never to template it: `"$name"` in a shell, `os.environ["name"]` in Python,
+    /// `process.env.name` in Node, and so on. Reserve `{{ }}` for developer-authored
+    /// templates.
     pub args: Vec<Arg>,
     /// `Requires:` names the tasks this one depends on. mdtask-core does not run
     /// them (execution stays the caller's), but [`dependency_order`] resolves the
@@ -234,13 +236,13 @@ impl Task {
     }
 
     /// The declared argument names this task interpolates into its **script** via
-    /// `{{ arg }}` (raw text substitution, applied before the shell parses the
-    /// script). Because `{{ }}` is not shell-quoted, each of these is a shell
-    /// injection point for an untrusted argument value. A surface that runs a task
+    /// `{{ arg }}` (raw text substitution, spliced in before the interpreter parses
+    /// the script). Because it is not quoted, each of these is an injection point
+    /// for an untrusted argument value, in any language. A surface that runs a task
     /// with caller-controlled argument values (an agent/MCP surface) should refuse
-    /// a task that has any, and the author should switch to `"$arg"`, which the
-    /// shell quotes. Empty for a task that only uses `$arg`, the safe form. See
-    /// [`TaskFile::invocation`].
+    /// a task that has any; the author should read the value from the environment
+    /// instead (`"$arg"`, `os.environ["arg"]`, ...). Empty for a task that reads its
+    /// args from the environment, the safe form. See [`TaskFile::invocation`].
     pub fn script_arg_templates(&self) -> Vec<&str> {
         let declared: std::collections::BTreeSet<&str> =
             self.args.iter().map(|a| a.name.as_str()).collect();
