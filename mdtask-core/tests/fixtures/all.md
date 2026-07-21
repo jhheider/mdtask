@@ -26,11 +26,11 @@ echo "$greeting, {{ name }} ($MOOD) {{ extra }}"
 
 ## render
 
-`Dir: .` pins the task to the task file's own directory (the inverse of the
-default, which runs where the command was invoked).
+`Opts: inherit-cwd` runs the task where the command was invoked, the inverse of
+the default (the task file's own directory).
 
 Args: file
-Dir: .
+Opts: inherit-cwd
 
 ```zsh
 print -r -- "rendering {{ file }}"

@@ -41,9 +41,9 @@ fn every_feature_parses_and_combines() {
     assert_eq!(greet.env, vec![("MOOD".into(), "cheery".into())]);
     assert_eq!(greet.lang, "sh");
 
-    // render: `Dir: .` pins to the task file's dir, zsh interpreter.
+    // render: `Opts: inherit-cwd`, zsh interpreter.
     let render = tf.task("render").unwrap();
-    assert_eq!(render.dir.as_deref(), Some("."));
+    assert!(render.inherits_cwd());
     assert_eq!(render.lang, "zsh");
 
     // deploy: dependency + agent gate.
@@ -64,7 +64,7 @@ fn every_feature_parses_and_combines() {
 }
 
 #[test]
-fn invocations_combine_substitution_env_interpreter_and_dir() {
+fn invocations_combine_substitution_env_interpreter_and_cwd() {
     let tf = parse(ALL);
 
     // greet: {{ name }} substituted; $greeting/$MOOD/$SHARED all in the env. Only
@@ -99,10 +99,10 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
             inv.env
         );
     }
-    // No Dir:, so the invocation directory, not where the task file lives.
-    assert_eq!(inv.cwd, Path::new("/cwd"));
+    // Default: the task file's directory, not where invoked.
+    assert_eq!(inv.cwd, Path::new("/proj"));
 
-    // render: `Dir: .` pins to the task file's own directory.
+    // render: `Opts: inherit-cwd` runs it in the invocation directory instead.
     let render = tf.task("render").unwrap();
     let inv = tf
         .invocation(
@@ -113,6 +113,6 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
         )
         .unwrap();
     assert_eq!(inv.program, "zsh");
-    assert_eq!(inv.cwd, Path::new("/proj"));
+    assert_eq!(inv.cwd, Path::new("/cwd"));
     assert!(inv.args[1].contains("rendering notes/deep/a.md"));
 }

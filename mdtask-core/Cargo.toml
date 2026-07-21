@@ -1,6 +1,6 @@
 [package]
 name = "mdtask-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embeddable, execution-capable Rust task runner whose tasks are defined in markdown (heading = task, fenced block = script, Key: value metadata)."
 keywords = ["task", "runner", "markdown", "make", "just"]
 categories = ["development-tools", "parser-implementations"]
