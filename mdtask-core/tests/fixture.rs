@@ -74,7 +74,7 @@ fn invocations_combine_substitution_env_interpreter_and_dir() {
         .unwrap();
     assert_eq!(inv.program, "sh");
     // {{ name }} is substituted; $greeting / $MOOD stay shell vars (resolved from
-    // the env at run time — the safe path for values the shell should quote).
+    // the env at run time - the safe path for values the shell should quote).
     assert!(
         inv.args[1].contains("$greeting, sam ($MOOD)"),
         "got {:?}",

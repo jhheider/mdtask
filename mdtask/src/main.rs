@@ -1,9 +1,9 @@
-//! `mdtask` — run tasks defined in markdown. A thin CLI over `mdtask-core`.
+//! `mdtask` - run tasks defined in markdown. A thin CLI over `mdtask-core`.
 //!
 //! ```text
 //! mdtask                 list tasks (walks up for tasks.md / maskfile.md / README.md)
-//! mdtask <name> [args…]  run a task; positional args fill its `Args:` in order
-//! mdtask -f FILE …       use a specific task file (no directory walk)
+//! mdtask <name> [args...]  run a task; positional args fill its `Args:` in order
+//! mdtask -f FILE ...       use a specific task file (no directory walk)
 //! ```
 //!
 //! Task files are layered like just's `set fallback`: files nearer the current

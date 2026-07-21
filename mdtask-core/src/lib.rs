@@ -1,10 +1,10 @@
-//! `mdtask-core` — parse a markdown task file into a typed command tree and build
+//! `mdtask-core` - parse a markdown task file into a typed command tree and build
 //! runnable invocations. Embeddable, execution-capable, and dependency-free.
 //!
 //! A task file is ordinary markdown (a `tasks.md`, a `maskfile.md`, or a project
 //! `README.md`): a heading is a task, the first fenced code block under it is the
 //! script, and `Key: value` lines in the body carry metadata. The format is an
-//! own grammar — a graceful superset that borrows xc's metadata vocabulary and
+//! own grammar - a graceful superset that borrows xc's metadata vocabulary and
 //! mask's runtime shape (per-fence interpreter, positional args), readable by
 //! those tools where the features overlap but not claiming compatibility.
 //!
@@ -22,7 +22,7 @@
 //! ```
 //!
 //! Parsing is pure; `Task`/`TaskFile` build an [`Invocation`] (program, args,
-//! env, cwd) which the caller runs — on its own worker/thread — or executes with
+//! env, cwd) which the caller runs - on its own worker/thread - or executes with
 //! [`Invocation::run`]. The parser is line-based (no CommonMark dependency), so a
 //! `#` or `Key:` inside a fenced block is never mistaken for structure.
 
@@ -31,9 +31,9 @@ use std::path::{Path, PathBuf};
 
 /// A parsed task file: the tasks, any file-level environment hoisted to all of
 /// them (an `Env:` under a section heading, applied to **every** task regardless
-/// of where in the document it appears — hoisting is not positional), and any
+/// of where in the document it appears - hoisting is not positional), and any
 /// parse warnings (an unterminated fence, a duplicate task, an unknown fence
-/// language). Parsing is infallible — a malformed file still yields what it can —
+/// language). Parsing is infallible - a malformed file still yields what it can -
 /// so an embedder should surface `warnings` rather than trust silence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskFile {
@@ -49,32 +49,32 @@ pub struct Task {
     pub name: String,
     /// Prose in the task body that is not a recognized `Key: value` line.
     pub description: String,
-    /// The fenced block's info-string language (`sh`, `zsh`, `python`, …); empty
+    /// The fenced block's info-string language (`sh`, `zsh`, `python`, ...); empty
     /// means an unlabeled fence (treated as `sh`).
     pub lang: String,
     /// The script (the fenced block's contents), verbatim.
     pub script: String,
-    /// `Dir:` — the working directory, relative to the run root. May contain
+    /// `Dir:` - the working directory, relative to the run root. May contain
     /// `{{ arg }}`, and `dirname(PATH)` takes a path's lexical parent (so
     /// `Dir: dirname({{ file }})` runs in the file's folder). Resolution is
-    /// purely lexical — no filesystem access.
+    /// purely lexical - no filesystem access.
     pub dir: Option<String>,
-    /// `Env:` — extra environment for this task.
+    /// `Env:` - extra environment for this task.
     pub env: Vec<(String, String)>,
-    /// `Args:` — positional argument names. Each is substituted as `{{ name }}`
+    /// `Args:` - positional argument names. Each is substituted as `{{ name }}`
     /// in the script AND exported as `$name`. **`{{ name }}` is raw text
     /// substitution** (it happens before the shell parses the script), so
-    /// `"{{ name }}"` is NOT injection-safe for untrusted values — prefer
+    /// `"{{ name }}"` is NOT injection-safe for untrusted values - prefer
     /// `"$name"`, which the shell quotes. Reserve `{{ }}` for `Dir:` and for
     /// developer-authored templates.
     pub args: Vec<String>,
-    /// `Requires:` — task names this one depends on (parsed; the caller sequences
-    /// them — mdtask-core does not run dependencies itself yet).
+    /// `Requires:` - task names this one depends on (parsed; the caller sequences
+    /// them - mdtask-core does not run dependencies itself yet).
     pub requires: Vec<String>,
-    /// `Agent: allow` — opt in to being listed/run by an MCP/agent surface.
+    /// `Agent: allow` - opt in to being listed/run by an MCP/agent surface.
     /// Advisory data: nothing in mdtask-core's execution path checks it. A caller
     /// exposing tasks to an agent must filter with [`TaskFile::agent_tasks`] (off
-    /// by default), which is the enforcement point — the flag alone is not.
+    /// by default), which is the enforcement point - the flag alone is not.
     pub agent_allow: bool,
 }
 
@@ -101,14 +101,14 @@ impl std::fmt::Display for MissingArg {
 impl std::error::Error for MissingArg {}
 
 impl TaskFile {
-    /// Find a task by name (exact, case-sensitive — heading text as written). The
+    /// Find a task by name (exact, case-sensitive - heading text as written). The
     /// first definition wins if a name is duplicated (a warning is recorded).
     pub fn task(&self, name: &str) -> Option<&Task> {
         self.tasks.iter().find(|t| t.name == name)
     }
 
     /// The tasks that opted in to an agent/MCP surface via `Agent: allow`. A
-    /// caller exposing tasks to an agent should list and run **only** these — the
+    /// caller exposing tasks to an agent should list and run **only** these - the
     /// flag is advisory data on `Task`, so this iterator is the enforcement point,
     /// not the field. (Direct field access bypasses the gate by design; the gate
     /// lives at the surface that chooses what to expose.)
@@ -116,13 +116,13 @@ impl TaskFile {
         self.tasks.iter().filter(|t| t.agent_allow)
     }
 
-    /// Build the invocation for `task`, given `args` (name → value). Combines the
+    /// Build the invocation for `task`, given `args` (name -> value). Combines the
     /// file-level hoisted env, the task env, and the args-as-env; substitutes
     /// `{{ arg }}` in the script and `Dir:`; resolves the working directory
     /// against `root`. Errors if a declared arg has no value.
     ///
     /// Pure and cheap: no filesystem or process access, so it is safe to call
-    /// straight from a UI event handler / render path — build the `Invocation`
+    /// straight from a UI event handler / render path - build the `Invocation`
     /// here, run it elsewhere.
     pub fn invocation(
         &self,
@@ -138,13 +138,13 @@ impl TaskFile {
         let script = substitute(&task.script, args);
         let (program, flag) = interpreter(&task.lang);
 
-        // Env precedence: hoisted, then task, then args (args win — they are the
+        // Env precedence: hoisted, then task, then args (args win - they are the
         // most specific), so `$name` resolves to the passed value.
         let mut env = self.env.clone();
         env.extend(task.env.iter().cloned());
         env.extend(args.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        // Purely lexical — no filesystem access, so `invocation` stays a cheap,
+        // Purely lexical - no filesystem access, so `invocation` stays a cheap,
         // deterministic, off-thread-safe builder. `Dir: dirname({{ file }})` runs
         // in the file's parent directory (the `[no-cd]`-from-dirname idea), and
         // works whether or not the file exists yet (a task that *creates* it).
@@ -223,7 +223,7 @@ fn substitute(src: &str, args: &BTreeMap<String, String>) -> String {
 
 /// Parse a markdown task file. Line-based (no CommonMark dependency): a heading
 /// starts a task, the first fenced block under it is the script, and `Key: value`
-/// lines set metadata. Infallible — problems are reported in [`TaskFile::warnings`],
+/// lines set metadata. Infallible - problems are reported in [`TaskFile::warnings`],
 /// not by dropping to silence. CRLF endings are normalized.
 pub fn parse(src: &str) -> TaskFile {
     let mut file = TaskFile::default();
@@ -277,7 +277,7 @@ pub fn parse(src: &str) -> TaskFile {
         apply_line(line, cur.as_mut(), &mut file.env);
     }
     // An unterminated fence at EOF: still capture the script (do not lose the
-    // task), but warn — a forgotten closing fence is a common authoring slip.
+    // task), but warn - a forgotten closing fence is a common authoring slip.
     if in_fence {
         if let Some(t) = cur.as_mut()
             && !have_script
@@ -300,7 +300,7 @@ fn finalize(task: Option<Task>, file: &mut TaskFile) {
         return;
     };
     if t.script.is_empty() {
-        file.env.append(&mut t.env); // section heading — hoist its env
+        file.env.append(&mut t.env); // section heading - hoist its env
         return;
     }
     t.description = t.description.trim().to_string();
@@ -366,7 +366,7 @@ fn opening_fence(line: &str) -> Option<&'static str> {
 }
 
 /// Whether `line` is a bare closing fence for `marker` (only the fence char,
-/// no info string — CommonMark's closing rule).
+/// no info string - CommonMark's closing rule).
 fn is_closing_fence(line: &str, marker: &str) -> bool {
     let ch = marker.as_bytes()[0];
     let t = line.trim();
@@ -376,7 +376,7 @@ fn is_closing_fence(line: &str, marker: &str) -> bool {
 /// Search for task files from `start` up to the filesystem root, **nearest
 /// first**. In each ancestor directory the first of `tasks.md`, `maskfile.md`,
 /// `README.md` that parses to at least one task is taken. The CLI layers these
-/// child-first (a nearer file shadows a farther one by task name — like just's
+/// child-first (a nearer file shadows a farther one by task name - like just's
 /// `set fallback`, so a project can inherit a baseline of tasks from a parent).
 /// Embedders with their own project root can ignore this and call [`parse`].
 pub fn find_task_files(start: &Path) -> Vec<(PathBuf, TaskFile)> {
@@ -477,8 +477,8 @@ fn apply_line(line: &str, task: Option<&mut Task>, file_env: &mut Vec<(String, S
 }
 
 /// Split `Key: value`, returning the lowercased key if the line looks like one
-/// (a single-word key before the first colon). Leading indentation is allowed —
-/// a `Dir:` indented under a list still counts — because only *known* keys act
+/// (a single-word key before the first colon). Leading indentation is allowed -
+/// a `Dir:` indented under a list still counts - because only *known* keys act
 /// (see `apply_line`), so ordinary prose with a colon stays description.
 fn split_key(line: &str) -> Option<(String, &str)> {
     let colon = line.find(':')?;
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn a_stray_fence_open_does_not_close_an_unterminated_block() {
-        // ```sh has an info string, so it opens, it does not close — a bare ```
+        // ```sh has an info string, so it opens, it does not close - a bare ```
         // is the only close. (The trailing block here is what closes it.)
         let tf = parse("## a\n\n```sh\none\n```sh\ntwo\n```\n");
         assert!(tf.tasks[0].script.contains("one"));
