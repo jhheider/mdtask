@@ -18,7 +18,7 @@
 //! echo \"hello {{ name }}\"\n\
 //! ```\n");
 //! let task = tf.task("greet").unwrap();
-//! assert_eq!(task.args, ["name"]);
+//! assert_eq!(task.args[0].name, "name");
 //! ```
 //!
 //! Parsing is pure; `Task`/`TaskFile` build an [`Invocation`] (program, args,
@@ -54,20 +54,24 @@ pub struct Task {
     pub lang: String,
     /// The script (the fenced block's contents), verbatim.
     pub script: String,
-    /// `Dir:` - the working directory, relative to the run root. May contain
-    /// `{{ arg }}`, and `dirname(PATH)` takes a path's lexical parent (so
-    /// `Dir: dirname({{ file }})` runs in the file's folder). Resolution is
-    /// purely lexical - no filesystem access.
+    /// `Dir:` - override the working directory. **When absent, a task runs in
+    /// the invocation directory**, not where the task file lives, so an
+    /// inherited/global task acts on your current project. A relative value is
+    /// resolved against the task file's own directory (`Dir: .` pins the task
+    /// there); an absolute value is used verbatim. May contain `{{ arg }}`.
+    /// Resolution is purely lexical - no filesystem access. See
+    /// [`TaskFile::invocation`].
     pub dir: Option<String>,
     /// `Env:` - extra environment for this task.
     pub env: Vec<(String, String)>,
-    /// `Args:` - positional argument names. Each is substituted as `{{ name }}`
-    /// in the script AND exported as `$name`. **`{{ name }}` is raw text
-    /// substitution** (it happens before the shell parses the script), so
-    /// `"{{ name }}"` is NOT injection-safe for untrusted values - prefer
-    /// `"$name"`, which the shell quotes. Reserve `{{ }}` for `Dir:` and for
-    /// developer-authored templates.
-    pub args: Vec<String>,
+    /// `Args:` - positional arguments (just's syntax): `name` is required,
+    /// `name='default'` is optional, and a trailing `*name` is variadic (collects
+    /// the rest, space-joined). Each is substituted as `{{ name }}` in the script
+    /// AND exported as `$name`. **`{{ name }}` is raw text substitution** (before
+    /// the shell parses the script), so `"{{ name }}"` is NOT injection-safe for
+    /// untrusted values - prefer `"$name"`, which the shell quotes. Reserve
+    /// `{{ }}` for `Dir:` and developer-authored templates.
+    pub args: Vec<Arg>,
     /// `Requires:` - task names this one depends on (parsed; the caller sequences
     /// them - mdtask-core does not run dependencies itself yet).
     pub requires: Vec<String>,
@@ -76,6 +80,16 @@ pub struct Task {
     /// exposing tasks to an agent must filter with [`TaskFile::agent_tasks`] (off
     /// by default), which is the enforcement point - the flag alone is not.
     pub agent_allow: bool,
+}
+
+/// One declared positional argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arg {
+    pub name: String,
+    /// `*name`: collects all remaining positionals, space-joined.
+    pub variadic: bool,
+    /// `name='default'`: optional, with this value when not supplied.
+    pub default: Option<String>,
 }
 
 /// A runnable command built from a task: what to exec, with what environment, in
@@ -116,10 +130,20 @@ impl TaskFile {
         self.tasks.iter().filter(|t| t.agent_allow)
     }
 
-    /// Build the invocation for `task`, given `args` (name -> value). Combines the
-    /// file-level hoisted env, the task env, and the args-as-env; substitutes
-    /// `{{ arg }}` in the script and `Dir:`; resolves the working directory
-    /// against `root`. Errors if a declared arg has no value.
+    /// Build the invocation for `task`, given `args` (name -> value, from
+    /// [`TaskFile::bind`] or an embedder's prompts). Substitutes `{{ arg }}` in
+    /// the script and `Dir:`, exports args + env, and resolves the cwd:
+    ///
+    /// - **no `Dir:`** -> `cwd` (the invocation directory: a task runs where you
+    ///   are, so an inherited/global task acts on your current repo, not on the
+    ///   directory the task file happens to live in).
+    /// - **`Dir:` relative** -> resolved against `task_file_dir` (the file that
+    ///   defined the task; `None` falls back to `cwd`). `Dir: .` pins the task to
+    ///   the task file's own directory (the inverse of just's `[no-cd]`).
+    /// - **`Dir:` absolute** -> used verbatim.
+    ///
+    /// Missing optional/variadic args are filled from their defaults, so a partial
+    /// `args` map is fine; errors only on a missing *required* arg.
     ///
     /// Pure and cheap: no filesystem or process access, so it is safe to call
     /// straight from a UI event handler / render path - build the `Invocation`
@@ -128,51 +152,95 @@ impl TaskFile {
         &self,
         task: &Task,
         args: &BTreeMap<String, String>,
-        root: &Path,
+        cwd: &Path,
+        task_file_dir: Option<&Path>,
     ) -> Result<Invocation, MissingArg> {
-        for name in &task.args {
-            if !args.contains_key(name) {
-                return Err(MissingArg(name.clone()));
+        // Fill defaults for any declared arg the caller did not supply.
+        let mut effective = args.clone();
+        for a in &task.args {
+            if !effective.contains_key(&a.name) {
+                if a.variadic {
+                    effective.insert(a.name.clone(), String::new());
+                } else if let Some(d) = &a.default {
+                    effective.insert(a.name.clone(), d.clone());
+                } else {
+                    return Err(MissingArg(a.name.clone()));
+                }
             }
         }
-        let script = substitute(&task.script, args);
+
+        let script = substitute(&task.script, &effective);
         let (program, flag) = interpreter(&task.lang);
 
-        // Env precedence: hoisted, then task, then args (args win - they are the
-        // most specific), so `$name` resolves to the passed value.
+        // Env precedence: hoisted, then task, then args (args win - most specific),
+        // so `$name` resolves to the passed value.
         let mut env = self.env.clone();
         env.extend(task.env.iter().cloned());
-        env.extend(args.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env.extend(effective.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        // Purely lexical - no filesystem access, so `invocation` stays a cheap,
-        // deterministic, off-thread-safe builder. `Dir: dirname({{ file }})` runs
-        // in the file's parent directory (the `[no-cd]`-from-dirname idea), and
-        // works whether or not the file exists yet (a task that *creates* it).
-        let cwd = match &task.dir {
-            None => root.to_path_buf(),
-            Some(d) => root.join(resolve_dir(d, args)),
+        let run_cwd = match &task.dir {
+            None => cwd.to_path_buf(),
+            Some(d) => {
+                let d = substitute(d, &effective);
+                let d = d.trim().to_string();
+                let p = Path::new(&d);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    task_file_dir.unwrap_or(cwd).join(&d)
+                }
+            }
         };
 
         Ok(Invocation {
             program: program.to_string(),
             args: vec![flag.to_string(), script],
             env,
-            cwd,
+            cwd: run_cwd,
         })
+    }
+
+    /// Bind positional argument values (e.g. from the CLI) to a task's declared
+    /// `Args:`, applying defaults and collecting a trailing `*variadic` from the
+    /// rest. Feeds [`TaskFile::invocation`]; errors on a missing required arg.
+    pub fn bind(
+        task: &Task,
+        positional: &[String],
+    ) -> Result<BTreeMap<String, String>, MissingArg> {
+        let mut map = BTreeMap::new();
+        let mut i = 0;
+        for a in &task.args {
+            if a.variadic {
+                map.insert(
+                    a.name.clone(),
+                    positional[i.min(positional.len())..].join(" "),
+                );
+                i = positional.len();
+            } else if i < positional.len() {
+                map.insert(a.name.clone(), positional[i].clone());
+                i += 1;
+            } else if let Some(d) = &a.default {
+                map.insert(a.name.clone(), d.clone());
+            } else {
+                return Err(MissingArg(a.name.clone()));
+            }
+        }
+        Ok(map)
     }
 }
 
 impl Invocation {
-    /// Execute the invocation and wait for it, capturing output. Convenience for
-    /// the CLI; an embedder that must not block a thread should run the fields
-    /// itself. Args/env are exported to the child; nothing is inherited beyond
-    /// the parent environment plus `env`.
-    pub fn run(&self) -> std::io::Result<std::process::Output> {
+    /// Execute the invocation and wait for it, inheriting the parent's stdio so
+    /// the task's output streams straight through (the CLI wants this - a task is
+    /// an interactive command, not a captured subprocess). An embedder that must
+    /// not block a thread, or that wants to capture output, should build the
+    /// [`std::process::Command`] from the fields itself.
+    pub fn run(&self) -> std::io::Result<std::process::ExitStatus> {
         std::process::Command::new(&self.program)
             .args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.cwd)
-            .output()
+            .status()
     }
 }
 
@@ -319,21 +387,6 @@ fn finalize(task: Option<Task>, file: &mut TaskFile) {
     file.tasks.push(t);
 }
 
-/// Resolve a `Dir:` value: substitute `{{ arg }}`, then apply a `dirname(PATH)`
-/// wrapper as a lexical parent (no filesystem access). Everything else is used
-/// verbatim as a directory path.
-fn resolve_dir(dir: &str, args: &BTreeMap<String, String>) -> String {
-    let s = substitute(dir, args);
-    let s = s.trim();
-    if let Some(inner) = s.strip_prefix("dirname(").and_then(|x| x.strip_suffix(')')) {
-        return Path::new(inner.trim())
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-    }
-    s.to_string()
-}
-
 /// Whether a fence language maps to an interpreter (unlabeled counts as `sh`).
 fn is_known_lang(lang: &str) -> bool {
     matches!(
@@ -444,7 +497,7 @@ fn apply_line(line: &str, task: Option<&mut Task>, file_env: &mut Vec<(String, S
             }
             "args" | "arguments" => {
                 if let Some(t) = task {
-                    t.args = value.split_whitespace().map(str::to_string).collect();
+                    t.args = parse_args(value);
                 }
                 return;
             }
@@ -504,6 +557,78 @@ fn parse_env(value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Parse an `Args:` value into declared [`Arg`]s (just's syntax): `name` is
+/// required, `*name` collects the rest (variadic), `name='default'` (or
+/// `name="default"`) is optional. Tokens are whitespace-separated, but a quoted
+/// default may itself contain spaces (`msg='hello world'`).
+fn parse_args(value: &str) -> Vec<Arg> {
+    tokenize_args(value)
+        .into_iter()
+        .filter_map(|tok| {
+            let (name, default) = match tok.split_once('=') {
+                Some((n, d)) => (n, Some(unquote(d).to_string())),
+                None => (tok.as_str(), None),
+            };
+            let (name, variadic) = match name.strip_prefix('*') {
+                Some(rest) => (rest, true),
+                None => (name, false),
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(Arg {
+                name: name.to_string(),
+                variadic,
+                default,
+            })
+        })
+        .collect()
+}
+
+/// Split an `Args:` value on whitespace, but keep a single- or double-quoted run
+/// (a default value) together so `msg='a b'` is one token.
+fn tokenize_args(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in value.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                cur.push(c);
+                quote = Some(c);
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Strip one matching pair of surrounding single or double quotes, if present.
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +665,10 @@ mod tests {
                 ("TIER".into(), "prod".into())
             ]
         );
-        assert_eq!(t.args, vec!["target"]);
+        assert_eq!(
+            t.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["target"]
+        );
         assert_eq!(t.requires, vec!["build", "test"]);
         assert!(t.agent_allow);
     }
@@ -580,43 +708,92 @@ mod tests {
         let tf = parse("## greet\n\nArgs: name\n\n```zsh\nprint \"hi {{ name }}\"\n```\n");
         let t = tf.task("greet").unwrap();
         let inv = tf
-            .invocation(t, &args(&[("name", "sam")]), Path::new("/root"))
+            .invocation(
+                t,
+                &args(&[("name", "sam")]),
+                Path::new("/here"),
+                Some(Path::new("/file")),
+            )
             .unwrap();
         assert_eq!(inv.program, "zsh");
         assert_eq!(inv.args[0], "-c");
         assert!(inv.args[1].contains("hi sam"));
         assert!(inv.env.contains(&("name".to_string(), "sam".to_string())));
-        assert_eq!(inv.cwd, Path::new("/root"));
+        // No Dir: -> runs in the invocation directory, not where the file lives.
+        assert_eq!(inv.cwd, Path::new("/here"));
     }
 
     #[test]
-    fn a_missing_arg_is_an_error() {
+    fn a_missing_required_arg_is_an_error() {
         let tf = parse("## t\n\nArgs: file\n\n```sh\ncat {{ file }}\n```\n");
         let t = tf.task("t").unwrap();
         assert_eq!(
-            tf.invocation(t, &args(&[]), Path::new("/root")),
+            tf.invocation(t, &args(&[]), Path::new("/here"), None),
             Err(MissingArg("file".into()))
         );
     }
 
     #[test]
-    fn dir_without_the_file_present_joins_the_root() {
-        let tf = parse("## t\n\nDir: sub/dir\n\n```sh\ntrue\n```\n");
+    fn optional_and_variadic_args_fill_from_defaults() {
+        let tf = parse(
+            "## t\n\nArgs: a b='fallback' *rest\n\n```sh\necho {{ a }} {{ b }} {{ rest }}\n```\n",
+        );
         let t = tf.task("t").unwrap();
-        let inv = tf.invocation(t, &args(&[]), Path::new("/root")).unwrap();
-        assert_eq!(inv.cwd, Path::new("/root/sub/dir"));
+        assert!(!t.args[0].variadic && t.args[0].default.is_none());
+        assert_eq!(t.args[1].default.as_deref(), Some("fallback"));
+        assert!(t.args[2].variadic);
+        // Only `a` supplied: `b` uses its default, `rest` is empty.
+        let inv = tf
+            .invocation(t, &args(&[("a", "x")]), Path::new("/here"), None)
+            .unwrap();
+        assert!(inv.args[1].contains("echo x fallback "));
+        // bind() collects a trailing variadic from the leftover positionals.
+        let bound =
+            TaskFile::bind(t, &["x".into(), "y".into(), "one".into(), "two".into()]).unwrap();
+        assert_eq!(bound.get("b").map(String::as_str), Some("y"));
+        assert_eq!(bound.get("rest").map(String::as_str), Some("one two"));
     }
 
     #[test]
-    fn dirname_is_lexical_and_works_before_the_file_exists() {
-        // The flagship [no-cd] case: run in a not-yet-created file's folder. No
-        // filesystem access, so this is deterministic and needs no real file.
-        let tf = parse("## t\n\nArgs: file\nDir: dirname({{ file }})\n\n```sh\ntrue\n```\n");
+    fn relative_dir_resolves_against_the_task_file_not_the_cwd() {
+        let tf = parse("## t\n\nDir: sub/dir\n\n```sh\ntrue\n```\n");
         let t = tf.task("t").unwrap();
         let inv = tf
-            .invocation(t, &args(&[("file", "out/report.pdf")]), Path::new("/root"))
+            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
             .unwrap();
-        assert_eq!(inv.cwd, Path::new("/root/out"));
+        assert_eq!(inv.cwd, Path::new("/proj/sub/dir"));
+    }
+
+    #[test]
+    fn dir_dot_pins_to_the_task_file_dir_and_absolute_is_verbatim() {
+        let dot = parse("## t\n\nDir: .\n\n```sh\ntrue\n```\n");
+        let t = dot.task("t").unwrap();
+        let inv = dot
+            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
+            .unwrap();
+        assert_eq!(inv.cwd, Path::new("/proj"));
+
+        let abs = parse("## t\n\nDir: /opt/build\n\n```sh\ntrue\n```\n");
+        let t = abs.task("t").unwrap();
+        let inv = abs
+            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
+            .unwrap();
+        assert_eq!(inv.cwd, Path::new("/opt/build"));
+    }
+
+    #[test]
+    fn dir_may_interpolate_an_arg() {
+        let tf = parse("## t\n\nArgs: name\nDir: {{ name }}\n\n```sh\ntrue\n```\n");
+        let t = tf.task("t").unwrap();
+        let inv = tf
+            .invocation(
+                t,
+                &args(&[("name", "out")]),
+                Path::new("/here"),
+                Some(Path::new("/proj")),
+            )
+            .unwrap();
+        assert_eq!(inv.cwd, Path::new("/proj/out"));
     }
 
     #[test]

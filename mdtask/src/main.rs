@@ -13,7 +13,6 @@
 //! The library is the point; this is deliberately small (no arg-parser
 //! dependency).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -70,17 +69,22 @@ fn main() -> ExitCode {
         eprintln!("mdtask: no task named {name:?}");
         return ExitCode::FAILURE;
     };
-    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // The task file's own directory anchors a relative `Dir:`; the current
+    // directory is where a task runs by default (no `Dir:`).
+    let task_file_dir = path.parent().unwrap_or(Path::new("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Positional CLI args fill the task's declared Args in order.
-    let values: BTreeMap<String, String> = task
-        .args
-        .iter()
-        .cloned()
-        .zip(args.iter().skip(1).cloned())
-        .collect();
+    // Positional CLI args bind to the task's declared Args (defaults + variadic).
+    let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+    let values = match TaskFile::bind(task, &positional) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("mdtask: {e} (usage: mdtask {name} {})", usage(task));
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let inv = match tf.invocation(task, &values, &root) {
+    let inv = match tf.invocation(task, &values, &cwd, Some(task_file_dir)) {
         Ok(inv) => inv,
         Err(e) => {
             eprintln!("mdtask: {e} (usage: mdtask {name} {})", usage(task));
@@ -126,11 +130,20 @@ fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
     }
 }
 
-/// `<arg1> <arg2>` for a task's declared args, for usage/list output.
+/// `<arg1> [arg2] [rest...]` for a task's declared args, for usage/list output:
+/// required args in angle brackets, defaulted/variadic in square brackets.
 fn usage(t: &Task) -> String {
     t.args
         .iter()
-        .map(|a| format!("<{a}>"))
+        .map(|a| {
+            if a.variadic {
+                format!("[{}...]", a.name)
+            } else if a.default.is_some() {
+                format!("[{}]", a.name)
+            } else {
+                format!("<{}>", a.name)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }

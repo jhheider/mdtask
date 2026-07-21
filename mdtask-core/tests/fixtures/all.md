@@ -14,21 +14,23 @@ cargo build --release
 
 ## greet
 
-Positional args, per-task env, `{{ }}` and `$var` in one script.
+Positional args (one required, one with a default, a trailing variadic),
+per-task env, `{{ }}` and `$var` in one script.
 
-Args: name greeting
+Args: name greeting='hello' *extra
 Env: MOOD=cheery
 
 ```sh
-echo "$greeting, {{ name }} ($MOOD)"
+echo "$greeting, {{ name }} ($MOOD) {{ extra }}"
 ```
 
 ## render
 
-Run in the target file's own folder via `dirname` (works before it exists).
+`Dir: .` pins the task to the task file's own directory (the inverse of the
+default, which runs where the command was invoked).
 
 Args: file
-Dir: dirname({{ file }})
+Dir: .
 
 ```zsh
 print -r -- "rendering {{ file }}"

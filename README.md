@@ -20,10 +20,10 @@ cargo build --release
 
 ## pdf
 
-Render a note to PDF, in its own folder.
+Render a note to PDF. Runs where you invoke it, so `mdtask pdf notes/a.md`
+writes next to the note - no `Dir:` needed.
 
 Args: file
-Dir: dirname({{ file }})
 
 ```sh
 pandoc -t pdf -o "${file%md}pdf" "$file"
@@ -66,16 +66,21 @@ grammar and makes no round-trip promise.
 - **A heading with no script is a section**, not a task (so a `# Tasks` container
   is fine).
 - **Metadata** is `Key: value` lines in the task body (case-insensitive):
-  - `Args:` - positional argument names. Passed on the CLI in order; prompted by
-    an embedder. Substituted as `{{ name }}` in the script **and** exported as
-    `$name`. Prefer **`$name`** in scripts - the shell quotes it (`"$name"` is
-    injection-safe, `${name%md}` works). **`{{ name }}` is raw text substitution**
-    (before the shell parses the script), so `"{{ name }}"` is *not* safe for
-    untrusted values; reserve `{{ }}` for `Dir:` and developer-authored templates.
-  - `Dir:` - the working directory (relative to the run root; may use `{{ arg }}`).
-    `dirname(PATH)` takes a path's **lexical** parent - `Dir: dirname({{ file }})`
-    runs in the file's folder (the `[no-cd]` idea) and works whether or not the
-    file exists yet. Resolution never touches the filesystem.
+  - `Args:` - positional arguments, in just's syntax: `name` is **required**,
+    `name='default'` is **optional** (that value when omitted), and a trailing
+    `*name` is **variadic** (collects the rest, space-joined). Passed on the CLI
+    in order; prompted by an embedder. Each is substituted as `{{ name }}` in the
+    script **and** exported as `$name`. Prefer **`$name`** in scripts - the shell
+    quotes it (`"$name"` is injection-safe, `${name%md}` works). **`{{ name }}` is
+    raw text substitution** (before the shell parses the script), so `"{{ name }}"`
+    is *not* safe for untrusted values; reserve `{{ }}` for `Dir:` and
+    developer-authored templates.
+  - `Dir:` - override the working directory. **Without it, a task runs in the
+    directory you invoke it from** - so an inherited/global task acts on your
+    current project, not on wherever the task file happens to live. A *relative*
+    value is resolved against the **task file's own** directory (`Dir: .` pins the
+    task there, the inverse of just's `[no-cd]`); an *absolute* value is used
+    verbatim. May use `{{ arg }}`. Resolution never touches the filesystem.
   - `Env:` - extra environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a
     section heading is **hoisted** to every task (regardless of position).
   - `Requires:` - task dependencies (parsed; sequencing is the caller's for now).
@@ -100,16 +105,19 @@ access; an embedder with its own project root just calls it directly.)
 ## Embedding
 
 ```rust
-use std::collections::BTreeMap;
 use std::path::Path;
 
 let tf = mdtask_core::parse(&std::fs::read_to_string("tasks.md")?);
 let task = tf.task("pdf").expect("a pdf task");
 
-let mut args = BTreeMap::new();
-args.insert("file".into(), "notes/a.md".into());
+// Bind positional values to the task's Args (defaults + variadic), or build
+// the map yourself from an embedder's prompts.
+let args = mdtask_core::TaskFile::bind(task, &["notes/a.md".into()])?;
 
-let inv = tf.invocation(task, &args, Path::new("."))?;
+// cwd = where the task runs by default; the second path anchors a relative
+// `Dir:` (the task file's own directory). Pass `None` to fall back to cwd.
+let cwd = std::env::current_dir()?;
+let inv = tf.invocation(task, &args, &cwd, Some(Path::new(".")))?;
 // `inv` is { program, args, env, cwd } - run it on your own worker/thread,
 // or `inv.run()` for a blocking convenience.
 ```
