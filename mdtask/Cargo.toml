@@ -1,6 +1,6 @@
 [package]
 name = "mdtask"
-version = "0.1.0"
+version = "0.1.1"
 description = "Run tasks defined in markdown: mdtask <name> [args]. A thin CLI over mdtask-core."
 keywords = ["task", "runner", "markdown", "cli"]
 categories = ["development-tools", "command-line-utilities"]
