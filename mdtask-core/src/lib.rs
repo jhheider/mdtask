@@ -54,13 +54,13 @@ pub struct Task {
     pub lang: String,
     /// The script (the fenced block's contents), verbatim.
     pub script: String,
-    /// `Dir:` overrides the working directory. **When absent, a task runs in
-    /// the invocation directory**, not where the task file lives, so an inherited
-    /// or global task acts on your current project. A relative value resolves
-    /// against the task file's own directory (`Dir: .` pins the task there); an
-    /// absolute value is used verbatim. It may contain `{{ arg }}`, and resolution
-    /// is purely lexical, with no filesystem access. See [`TaskFile::invocation`].
-    pub dir: Option<String>,
+    /// `Opts:` carries per-task boolean flags, space-separated. The only flag
+    /// today is **`inherit-cwd`**: run the task in the directory mdtask was invoked
+    /// from, rather than the default (the directory of the task file that defines
+    /// it). Use it for a task that operates on a path relative to where you are (a
+    /// carry-around task such as `pdf a-note.md`). An unrecognized flag is recorded
+    /// as a warning and otherwise ignored. See [`TaskFile::invocation`].
+    pub opts: Vec<String>,
     /// `Env:` adds extra environment for this task.
     pub env: Vec<(String, String)>,
     /// `Args:` declares positional arguments in just's syntax. A bare `name` is
@@ -69,8 +69,8 @@ pub struct Task {
     /// `{{ name }}` in the script and also exported as `$name`. Note that
     /// **`{{ name }}` is raw text substitution**, applied before the shell parses
     /// the script, so `"{{ name }}"` is NOT injection-safe for untrusted values.
-    /// Prefer `"$name"`, which the shell quotes, and reserve `{{ }}` for `Dir:`
-    /// and developer-authored templates.
+    /// Prefer `"$name"`, which the shell quotes, and reserve `{{ }}` for
+    /// developer-authored templates.
     pub args: Vec<Arg>,
     /// `Requires:` names the tasks this one depends on. mdtask-core does not run
     /// them (execution stays the caller's), but [`dependency_order`] resolves the
@@ -221,15 +221,26 @@ pub fn dependency_order(
     Ok(order)
 }
 
+/// The `Opts:` flags mdtask recognizes. An `Opts:` value outside this set is
+/// recorded as a warning and otherwise ignored, so a file written for a newer
+/// mdtask does not hard-fail on an older one.
+pub const KNOWN_OPTS: &[&str] = &["inherit-cwd"];
+
 impl Task {
+    /// Whether this task opted into `Opts: inherit-cwd`: run it in the invocation
+    /// directory rather than the default (the task file's own directory).
+    pub fn inherits_cwd(&self) -> bool {
+        self.opts.iter().any(|o| o == "inherit-cwd")
+    }
+
     /// The declared argument names this task interpolates into its **script** via
     /// `{{ arg }}` (raw text substitution, applied before the shell parses the
     /// script). Because `{{ }}` is not shell-quoted, each of these is a shell
     /// injection point for an untrusted argument value. A surface that runs a task
     /// with caller-controlled argument values (an agent/MCP surface) should refuse
     /// a task that has any, and the author should switch to `"$arg"`, which the
-    /// shell quotes. Empty for a task that only uses `$arg` (the safe form) or uses
-    /// `{{ }}` solely in `Dir:` (which is not the script). See [`TaskFile::invocation`].
+    /// shell quotes. Empty for a task that only uses `$arg`, the safe form. See
+    /// [`TaskFile::invocation`].
     pub fn script_arg_templates(&self) -> Vec<&str> {
         let declared: std::collections::BTreeSet<&str> =
             self.args.iter().map(|a| a.name.as_str()).collect();
@@ -267,16 +278,19 @@ impl TaskFile {
 
     /// Build the invocation for `task`, given `args` mapping each name to a value
     /// (from [`TaskFile::bind`] or an embedder's prompts). It substitutes
-    /// `{{ arg }}` in the script and `Dir:`, exports the args and env, and resolves
-    /// the working directory this way:
+    /// `{{ arg }}` in the script, exports the args and env, and resolves the
+    /// working directory:
     ///
-    /// - With **no `Dir:`**, the task runs in `cwd`, the invocation directory, so
-    ///   an inherited or global task acts on your current repo rather than on the
-    ///   directory the task file happens to live in.
-    /// - A **relative `Dir:`** resolves against `task_file_dir`, the file that
-    ///   defined the task (`None` falls back to `cwd`). `Dir: .` pins the task to
-    ///   the task file's own directory, the inverse of just's `[no-cd]`.
-    /// - An **absolute `Dir:`** is used verbatim.
+    /// - **By default a task runs in `task_file_dir`**, the directory of the file
+    ///   that defines it (`None` falls back to `cwd`). A task script is written
+    ///   against its project's layout, so it runs from that project's root, the way
+    ///   `just` runs a recipe from its justfile's directory. For a task reached by
+    ///   the layered tree-walk, that is the directory of the ancestor file that
+    ///   defined it, again matching `just`'s fallback.
+    /// - **`Opts: inherit-cwd`** runs the task in `cwd`, the invocation directory
+    ///   instead, for a carry-around task that operates on a path relative to where
+    ///   you are (`just`'s `[no-cd]`). Anything more specific than these two anchors
+    ///   is a `cd` in the script.
     ///
     /// Missing optional and variadic args are filled from their defaults, so a
     /// partial `args` map is fine; only a missing *required* arg is an error.
@@ -314,18 +328,14 @@ impl TaskFile {
         env.extend(task.env.iter().cloned());
         env.extend(effective.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        let run_cwd = match &task.dir {
-            None => cwd.to_path_buf(),
-            Some(d) => {
-                let d = substitute(d, &effective);
-                let d = d.trim().to_string();
-                let p = Path::new(&d);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    task_file_dir.unwrap_or(cwd).join(&d)
-                }
-            }
+        // The task's own directory is the default anchor; `inherit-cwd` opts into
+        // the invocation directory. An absent or empty task_file_dir (a bare
+        // filename with no directory part, e.g. `-f tasks.md`) falls back to cwd,
+        // since running in an empty path would fail.
+        let run_cwd = match task_file_dir {
+            _ if task.inherits_cwd() => cwd.to_path_buf(),
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => cwd.to_path_buf(),
         };
 
         Ok(Invocation {
@@ -480,7 +490,7 @@ pub fn parse(src: &str) -> TaskFile {
             have_script = false;
             continue;
         }
-        apply_line(line, cur.as_mut(), &mut file.env);
+        apply_line(line, cur.as_mut(), &mut file.env, &mut file.warnings);
     }
     // An unterminated fence at EOF: still capture the script so the task is not
     // lost, but warn, since a forgotten closing fence is a common authoring slip.
@@ -615,7 +625,12 @@ fn heading(line: &str) -> Option<String> {
 /// Apply a body line: a recognized `Key: value` sets metadata (case-insensitive
 /// key, xc vocabulary); anything else is description. `Env:` before the first
 /// task accumulates into the hoisted `file_env`.
-fn apply_line(line: &str, task: Option<&mut Task>, file_env: &mut Vec<(String, String)>) {
+fn apply_line(
+    line: &str,
+    task: Option<&mut Task>,
+    file_env: &mut Vec<(String, String)>,
+    warnings: &mut Vec<String>,
+) {
     if let Some((key, value)) = split_key(line) {
         let value = value.trim();
         match key.as_str() {
@@ -627,10 +642,28 @@ fn apply_line(line: &str, task: Option<&mut Task>, file_env: &mut Vec<(String, S
                 }
                 return;
             }
-            "dir" | "directory" => {
+            "opts" | "options" => {
                 if let Some(t) = task {
-                    t.dir = Some(value.to_string());
+                    t.opts = value.split_whitespace().map(str::to_string).collect();
+                    for flag in &t.opts {
+                        if !KNOWN_OPTS.contains(&flag.as_str()) {
+                            warnings.push(format!(
+                                "unknown option {flag:?} in `Opts:` (known: {})",
+                                KNOWN_OPTS.join(", ")
+                            ));
+                        }
+                    }
                 }
+                return;
+            }
+            "dir" | "directory" => {
+                // Removed in v0.2. A task now runs in its file's directory by
+                // default; `Opts: inherit-cwd` opts into the invocation directory.
+                warnings.push(
+                    "`Dir:` was removed in v0.2; a task runs in its file's directory \
+                     by default. Use `Opts: inherit-cwd`, or `cd` in the script."
+                        .to_string(),
+                );
                 return;
             }
             "args" | "arguments" => {
@@ -669,7 +702,7 @@ fn apply_line(line: &str, task: Option<&mut Task>, file_env: &mut Vec<(String, S
 
 /// Split `Key: value`, returning the lowercased key if the line looks like one
 /// (a single-word key before the first colon). Leading indentation is allowed, so
-/// a `Dir:` indented under a list still counts. This is safe because only *known*
+/// an `Env:` indented under a list still counts. This is safe because only *known*
 /// keys act (see `apply_line`), so ordinary prose with a colon stays description.
 fn split_key(line: &str) -> Option<(String, &str)> {
     let colon = line.find(':')?;
@@ -790,12 +823,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_keys_are_xc_vocabulary_case_insensitive() {
+    fn metadata_keys_are_case_insensitive() {
         let tf = parse(
-            "## deploy\n\nDIR: {{ target }}\nEnv: REGION=us, TIER=prod\nArgs: target\nRequires: build, test\nAgent: allow\n\n```sh\necho go\n```\n",
+            "## deploy\n\nOPTS: inherit-cwd\nEnv: REGION=us, TIER=prod\nArgs: target\nRequires: build, test\nAgent: allow\n\n```sh\necho go\n```\n",
         );
         let t = &tf.tasks[0];
-        assert_eq!(t.dir.as_deref(), Some("{{ target }}"));
+        assert_eq!(t.opts, vec!["inherit-cwd"]);
+        assert!(t.inherits_cwd());
         assert_eq!(
             t.env,
             vec![
@@ -826,10 +860,10 @@ mod tests {
     #[test]
     fn fence_content_is_not_parsed_as_structure() {
         // A `## heading` and a `Key:` line inside a fence stay in the script.
-        let tf = parse("## a\n\n```sh\n## not a task\nDir: not-metadata\n```\n");
+        let tf = parse("## a\n\n```sh\n## not a task\nEnv: NOPE=1\n```\n");
         assert_eq!(tf.tasks.len(), 1);
         assert!(tf.tasks[0].script.contains("## not a task"));
-        assert!(tf.tasks[0].dir.is_none());
+        assert!(tf.tasks[0].env.is_empty());
     }
 
     #[test]
@@ -857,8 +891,8 @@ mod tests {
         assert_eq!(inv.args[0], "-c");
         assert!(inv.args[1].contains("hi sam"));
         assert!(inv.env.contains(&("name".to_string(), "sam".to_string())));
-        // No Dir:, so it runs in the invocation directory, not where the file lives.
-        assert_eq!(inv.cwd, Path::new("/here"));
+        // By default it runs in the task file's directory, not where invoked.
+        assert_eq!(inv.cwd, Path::new("/file"));
     }
 
     #[test]
@@ -893,45 +927,50 @@ mod tests {
     }
 
     #[test]
-    fn relative_dir_resolves_against_the_task_file_not_the_cwd() {
-        let tf = parse("## t\n\nDir: sub/dir\n\n```sh\ntrue\n```\n");
+    fn default_cwd_is_the_task_file_dir() {
+        let tf = parse("## t\n\n```sh\ntrue\n```\n");
         let t = tf.task("t").unwrap();
+        // Default: the file's directory, not where invoked.
         let inv = tf
-            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
-            .unwrap();
-        assert_eq!(inv.cwd, Path::new("/proj/sub/dir"));
-    }
-
-    #[test]
-    fn dir_dot_pins_to_the_task_file_dir_and_absolute_is_verbatim() {
-        let dot = parse("## t\n\nDir: .\n\n```sh\ntrue\n```\n");
-        let t = dot.task("t").unwrap();
-        let inv = dot
             .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
             .unwrap();
         assert_eq!(inv.cwd, Path::new("/proj"));
-
-        let abs = parse("## t\n\nDir: /opt/build\n\n```sh\ntrue\n```\n");
-        let t = abs.task("t").unwrap();
-        let inv = abs
-            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
+        // With no task_file_dir known (headless), it falls back to cwd.
+        let inv = tf
+            .invocation(t, &args(&[]), Path::new("/here"), None)
             .unwrap();
-        assert_eq!(inv.cwd, Path::new("/opt/build"));
+        assert_eq!(inv.cwd, Path::new("/here"));
+        // An empty task_file_dir (a bare filename's parent) also falls back to cwd,
+        // since running in an empty path would fail.
+        let inv = tf
+            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("")))
+            .unwrap();
+        assert_eq!(inv.cwd, Path::new("/here"));
     }
 
     #[test]
-    fn dir_may_interpolate_an_arg() {
-        let tf = parse("## t\n\nArgs: name\nDir: {{ name }}\n\n```sh\ntrue\n```\n");
+    fn inherit_cwd_runs_in_the_invocation_dir() {
+        let tf = parse("## t\n\nOpts: inherit-cwd\n\n```sh\ntrue\n```\n");
         let t = tf.task("t").unwrap();
+        assert!(t.inherits_cwd());
         let inv = tf
-            .invocation(
-                t,
-                &args(&[("name", "out")]),
-                Path::new("/here"),
-                Some(Path::new("/proj")),
-            )
+            .invocation(t, &args(&[]), Path::new("/here"), Some(Path::new("/proj")))
             .unwrap();
-        assert_eq!(inv.cwd, Path::new("/proj/out"));
+        assert_eq!(inv.cwd, Path::new("/here"));
+    }
+
+    #[test]
+    fn an_unknown_opt_warns_but_is_ignored() {
+        let tf = parse("## t\n\nOpts: inherit-cwd bogus\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.tasks[0].opts, vec!["inherit-cwd", "bogus"]);
+        assert!(tf.tasks[0].inherits_cwd()); // the known flag still applies
+        assert!(tf.warnings.iter().any(|w| w.contains("bogus")));
+    }
+
+    #[test]
+    fn a_leftover_dir_key_warns_about_the_v2_removal() {
+        let tf = parse("## t\n\nDir: sub/dir\n\n```sh\ntrue\n```\n");
+        assert!(tf.warnings.iter().any(|w| w.contains("`Dir:` was removed")));
     }
 
     // A `requires_of` for tests: a map from task name to its dependency names.
@@ -1037,8 +1076,8 @@ mod tests {
 
     #[test]
     fn indented_metadata_is_recognized() {
-        let tf = parse("## a\n\n- steps:\n  Dir: sub\n\n```sh\ntrue\n```\n");
-        assert_eq!(tf.tasks[0].dir.as_deref(), Some("sub"));
+        let tf = parse("## a\n\n- steps:\n  Env: KEY=val\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.tasks[0].env, vec![("KEY".into(), "val".into())]);
     }
 
     #[test]

@@ -20,10 +20,11 @@ cargo build --release
 
 ## pdf
 
-Render a note to PDF. It runs where you invoke it, so `mdtask pdf notes/a.md`
-writes next to the note, with no `Dir:` needed.
+Render a note to PDF. `inherit-cwd` runs it where you invoke it, so
+`mdtask pdf notes/a.md` resolves the path relative to your current directory.
 
 Args: file
+Opts: inherit-cwd
 
 ```sh
 pandoc -t pdf -o "${file%md}pdf" "$file"
@@ -55,10 +56,11 @@ the features I liked best from the others into a small, dependency-light **core
 library** (`mdtask-core`) that anything can embed. The CLI and the feature-gated
 MCP server are thin wrappers over it. The library is the point.
 
-It is **not** compatible with any one of them. It borrows conventions (xc's clean
-`Key: value` metadata vocabulary, mask's per-fence interpreter and positional
-args), and a simple xc or mask task file often parses without changes, but it
-owns its grammar and makes no compatibility or round-trip promise.
+It is **not** compatible with any one of them, and promises only a little. It
+borrows conventions (xc's clean `Key: value` metadata vocabulary, mask's per-fence
+interpreter and positional args), so the simplest xc or mask files may parse, but
+it owns its grammar and makes no compatibility or round-trip promise. Treat that
+overlap as a convenience, not a contract.
 
 ## The format
 
@@ -76,15 +78,13 @@ owns its grammar and makes no compatibility or round-trip promise.
     **`$name`** in scripts, because the shell quotes it (`"$name"` is
     injection-safe, and `${name%md}` works). **`{{ name }}` is raw text
     substitution**, applied before the shell parses the script, so `"{{ name }}"`
-    is *not* safe for untrusted values. Reserve `{{ }}` for `Dir:` and
-    developer-authored templates.
-  - `Dir:` overrides the working directory. **Without it, a task runs in the
-    directory you invoke it from**, so an inherited or global task acts on your
-    current project rather than on wherever the task file happens to live. A
-    *relative* value resolves against the **task file's own** directory (`Dir: .`
-    pins the task there, the inverse of just's `[no-cd]`); an *absolute* value is
-    used verbatim. It may use `{{ arg }}`, and resolution never touches the
-    filesystem.
+    is *not* safe for untrusted values. Reserve `{{ }}` for developer-authored
+    templates.
+  - `Opts:` carries per-task flags, space-separated. The one flag today is
+    **`inherit-cwd`**: run the task in the directory you invoked mdtask from,
+    instead of the default. Use it for a carry-around task that operates on a path
+    relative to where you are (this is just's `[no-cd]`). An unrecognized flag is
+    reported as a warning and ignored.
   - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
   - `Requires:` lists task dependencies. The CLI runs them first, resolved across
@@ -104,6 +104,17 @@ The parser is line-based (no CommonMark dependency), so a `#` or `Key:` inside a
 fenced block is never mistaken for structure. Parsing is infallible but records
 problems (an unterminated fence, a duplicate task, an unknown interpreter) in
 `TaskFile::warnings`; surface them rather than trusting silence.
+
+### Working directory
+
+A task runs in **the directory of the file that defines it** by default, the way
+`just` runs a recipe from its justfile's directory. A task script is written
+against its project's layout, so it runs from that project's root, even when you
+invoke mdtask from a subdirectory (and, for a task reached by the tree-walk
+below, from the directory of the ancestor file that defined it). Add
+`Opts: inherit-cwd` for the exception: a carry-around task that should operate on
+a path relative to wherever you are. Anything more specific than those two anchors
+is a `cd` in the script.
 
 ### Finding task files
 
