@@ -35,7 +35,6 @@ pandoc -t pdf -o "${file%md}pdf" "$file"
 $ mdtask                 # list tasks (walks up the tree; see below)
 $ mdtask build           # run one
 $ mdtask pdf notes/a.md  # positional args fill `Args:` in order
-$ mdtask lint            # shellcheck the shell scripts it finds
 ```
 
 ## Why this exists (honestly)
@@ -97,9 +96,10 @@ overlap as a convenience, not a contract.
     "already satisfied" mtime or hash check, so `Requires:` is for ordering, not
     for skipping work that is already done.
   - `Agent: allow` opts a task in to an MCP or agent surface. It is **off by
-    default**, and a caller must filter with `TaskFile::agent_tasks()` (the
-    enforcement point), so handing a task file to an agent never exposes ungated
-    shell. See [MCP](#mcp).
+    default**. `run` and `run_captured` ignore it; the gate is `run_agent` (which
+    refuses anything not allowed) and `agent_jobs` (which lists only the allowed
+    ones), so handing a task file to an agent never exposes ungated shell. See
+    [MCP](#mcp).
 
 The parser is line-based (no CommonMark dependency), so a `#` or `Key:` inside a
 fenced block is never mistaken for structure. Parsing is infallible but records
@@ -126,16 +126,6 @@ defines a task. Nearer files **shadow** farther ones by task name, like just's
 overrides them where it wants. (`mdtask-core::parse` itself does no filesystem
 access; an embedder with its own project root just calls it directly.)
 
-### Linting
-
-`mdtask lint [TASK]` runs [shellcheck](https://www.shellcheck.net/) over the
-shell scripts it finds (all tasks, or one named task). It only checks POSIX-sh
-family fences (`sh`, `bash`), since shellcheck cannot analyze `zsh`, `fish`, or a
-non-shell interpreter; those are skipped with a note. mdtask does not bundle
-shellcheck: it finds one on your `PATH`, falls back to `pkgx shellcheck`, and
-otherwise tells you to install it. `SC2154` (referenced but not assigned) is
-suppressed, because mdtask exports args and `Env:` as shell variables.
-
 ### MCP
 
 Built with `--features mcp`, `mdtask mcp` serves the working set to an MCP client
@@ -143,10 +133,11 @@ Built with `--features mcp`, `mdtask mcp` serves the working set to an MCP clien
 closed**: only tasks marked `Agent: allow` are exposed, everything else is
 invisible and unrunnable.
 
-- `list_tasks` enumerates **only** the allowed tasks, so the rest are not even
-  discoverable.
-- `run_task` re-checks the allowlist before running, so naming a hidden task
-  fails too. Its output is captured and returned as the tool result.
+- `list_tasks` enumerates **only** the allowed tasks (`agent_jobs`), so the rest
+  are not even discoverable.
+- `run_task` calls `run_agent`, which re-checks the allowlist before running, so
+  naming a hidden task fails too. Its output is captured and returned as the tool
+  result.
 - A `Requires:` dependency of an allowed task still runs, but is never listed and
   never independently callable. Crucially, the chain is resolved **within the
   allowed task's own file**, not by the global nearest-wins layering the CLI uses:
@@ -165,32 +156,41 @@ dependencies.
 
 ## Embedding
 
+A consumer deals only in jobs, their metadata, and running them. `parse` and
+`find_task_files` give you the jobs; `jobs()`/`job()` read them; `agent_jobs`
+lists the agent-exposed ones; and three functions run a job and its `Requires:`
+chain: `run` (inherits stdio, streaming), `run_captured` (aggregated output), and
+`run_agent` (the agent gate, captured). Interpreter selection, argv, working
+directory, and spawning are all internal, so nothing hands you a program or argv.
+
 ```rust
-use std::path::Path;
+let files = mdtask_core::find_task_files(&std::env::current_dir()?);
 
-let tf = mdtask_core::parse(&std::fs::read_to_string("tasks.md")?);
-let task = tf.task("pdf").expect("a pdf task");
+// Inspect a job's declared args before you run it.
+if let Some((_, tf)) = files.first() {
+    if let Some(job) = tf.job("pdf") {
+        println!("pdf takes {} arg(s)", job.args.len());
+    }
+}
 
-// Bind positional values to the task's Args (defaults + variadic), or build
-// the map yourself from an embedder's prompts.
-let args = mdtask_core::TaskFile::bind(task, &["notes/a.md".into()])?;
-
-// `cwd` is where the task runs by default; the second path anchors a relative
-// `Dir:` (the task file's own directory). Pass `None` to fall back to cwd.
+// Run it with captured output, off your render thread. Positional args fill the
+// job's `Args:` in order; the `Requires:` chain runs first, deps before dependents.
 let cwd = std::env::current_dir()?;
-let inv = tf.invocation(task, &args, &cwd, Some(Path::new(".")))?;
-// `inv` is { program, args, env, cwd }. Run it on your own worker or thread,
-// or call `inv.run()` for a blocking convenience.
+let out = mdtask_core::run_captured(&files, "pdf", &["notes/a.md".to_string()], &cwd)?;
+if out.status.success() {
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+}
 ```
 
-`mdtask-core` builds the [`Invocation`] for you and stays out of the way of
-*when* and *how* you run it, which is what lets a TUI keep execution off its
-render thread.
+`run_captured` builds and spawns the whole chain for you and hands back a single
+`std::process::Output`, so a TUI can run it on a worker and keep execution off its
+render thread. An MCP or agent host calls `run_agent` instead, which adds the
+allow gate and the injection guard.
 
 ## Status
 
-Early. The core parser and invocation builder are solid and tested; the CLI runs,
-lints, and serves MCP; a crates.io release is still pending. Intended consumers:
+Early. The core parser and runner are solid and tested; the CLI runs tasks and
+serves MCP; a crates.io release is still pending. Intended consumers:
 [gloaming](https://github.com/jhheider/gloaming) and penknife.
 
 ## Credits

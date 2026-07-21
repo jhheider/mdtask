@@ -1,32 +1,32 @@
 //! `mdtask mcp`: a feature-gated MCP (Model Context Protocol) stdio server that
 //! exposes ONLY the agent-allowed tasks (`Agent: allow`) to an MCP client.
 //!
-//! Security model: fail closed.
+//! Security model: fail closed, and the gate lives in `mdtask-core`, not here. This
+//! module is only the JSON-RPC surface; `mdtask_core::run_agent` is the enforcement
+//! point (allowlist, within-file dependency resolution, injection guard), and
+//! `mdtask_core::agent_jobs` is the listing that mirrors it.
 //!
 //! - A task is invisible and unrunnable unless its nearest definition carries
-//!   `Agent: allow`. `tools/list` enumerates only the allowed tasks, so the rest
-//!   are not discoverable, and `run_task` re-checks the allowlist before running,
-//!   so naming a hidden task fails too.
-//! - An allowed task's `Requires:` chain is resolved **within that task's own
-//!   file**, not by the global nearest-wins scan the CLI uses. The author who
-//!   wrote `Agent: allow` vouched for their file's tasks; a nearer, untrusted task
-//!   file in the invocation directory must not be able to shadow a dependency and
-//!   run attacker-controlled code through an allowed entry point. A dependency is
-//!   never listed and never independently callable.
-//! - A task that interpolates an argument into its **script** via `{{ arg }}` (raw,
-//!   unquoted substitution) is refused, since the agent controls the value: an
-//!   agent-run task must read the value from the environment (`"$arg"` in a
-//!   shell, `os.environ["arg"]` in Python, and so on), never template it.
+//!   `Agent: allow`. `tools/list` enumerates only `agent_jobs`, so the rest are not
+//!   discoverable, and `run_task` calls `run_agent`, which re-checks the allowlist
+//!   before running, so naming a hidden task fails too.
+//! - An allowed task's `Requires:` chain is resolved within that task's own file
+//!   (inside `run_agent`), not by the global nearest-wins scan the CLI uses. A
+//!   nearer, untrusted task file in the invocation directory cannot shadow a
+//!   dependency and run attacker-controlled code through an allowed entry point.
+//! - A task that raw-templates an argument into its script via `{{ arg }}` is
+//!   refused by `run_agent`, since the agent controls the value: an agent-run task
+//!   must read the value from the environment instead.
 //!
 //! Output is captured, not streamed, so the client receives it as tool-result
 //! text. The JSON-RPC loop is hand-rolled over serde_json (newline-delimited
 //! messages, the MCP stdio framing), with no SDK.
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mdtask_core::{Task, TaskFile};
+use mdtask_core::{TaskFile, agent_jobs};
 use serde_json::{Value, json};
 
 use crate::usage;
@@ -123,34 +123,18 @@ fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
-/// The agent-allowed tasks, one per name using the nearest definition (so a
-/// nearer non-allowed task shadows a farther allowed one, matching run
-/// semantics), keeping only those whose nearest definition opts in.
-fn allowed(files: &[(PathBuf, TaskFile)]) -> Vec<(&Path, &TaskFile, &Task)> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for (p, tf) in files {
-        for t in &tf.tasks {
-            if seen.insert(t.name.clone()) && t.agent_allow {
-                out.push((p.as_path(), tf, t));
-            }
-        }
-    }
-    out
-}
-
 fn list_tasks_text(files: &[(PathBuf, TaskFile)]) -> String {
-    let tasks = allowed(files);
-    if tasks.is_empty() {
+    let jobs = agent_jobs(files);
+    if jobs.is_empty() {
         return "No tasks are exposed to agents. Mark a task with `Agent: allow` to expose it."
             .to_string();
     }
     let mut s = String::new();
-    for (_, _, t) in tasks {
-        let u = usage(t);
+    for job in jobs {
+        let u = usage(job);
         let sep = if u.is_empty() { "" } else { " " };
-        let desc = t.description.lines().next().unwrap_or("");
-        s.push_str(&t.name);
+        let desc = job.description.lines().next().unwrap_or("");
+        s.push_str(&job.name);
         s.push_str(sep);
         s.push_str(&u);
         if !desc.is_empty() {
@@ -162,42 +146,14 @@ fn list_tasks_text(files: &[(PathBuf, TaskFile)]) -> String {
     s
 }
 
+/// Run an agent-allowed task and return its captured output. The allowlist, the
+/// within-file dependency resolution, and the injection guard are all enforced by
+/// `mdtask_core::run_agent`; this only shapes the arguments and the tool result.
 fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
     let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
     if name.is_empty() {
         return text_result("run_task requires a `name`".to_string(), true);
     }
-    // Fail closed: only an allowlisted task is runnable, and naming a hidden task
-    // fails. Capture the specific file that granted the allow, because the whole
-    // Requires: chain is resolved *within that file* below.
-    let Some((target_path, target_tf, target_task)) =
-        allowed(files).into_iter().find(|(_, _, t)| t.name == name)
-    else {
-        return text_result(
-            format!("task {name:?} is not available to agents (it lacks `Agent: allow`)"),
-            true,
-        );
-    };
-
-    // Refuse a task that interpolates an untrusted argument into its script via
-    // `{{ arg }}` (raw text substitution: an injection point when the agent
-    // controls the value). Such a task must read the value from the environment
-    // instead. Dependencies run argless with author-controlled defaults, so only
-    // the target, which receives the agent's `args`, is the injection surface.
-    let templated = target_task.script_arg_templates();
-    if !templated.is_empty() {
-        return text_result(
-            format!(
-                "task {name:?} interpolates argument(s) [{}] into its script via {{{{ }}}} \
-                 (raw substitution, an injection risk with agent-supplied values); it must \
-                 read them from the environment instead (\"$arg\", os.environ[\"arg\"], ...) \
-                 before an agent can run it. Refused.",
-                templated.join(", ")
-            ),
-            true,
-        );
-    }
-
     let positional: Vec<String> = arguments
         .get("args")
         .and_then(Value::as_array)
@@ -207,65 +163,16 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-
-    // Resolve the Requires: chain **within the allowed task's own file** (not the
-    // global nearest-wins scan). This is the security boundary: the author who
-    // wrote `Agent: allow` vouched for that file's tasks, so a nearer, untrusted
-    // task file in the invocation directory cannot shadow a dependency and slip
-    // attacker-controlled code into an allowed task's run.
-    let order = match mdtask_core::dependency_order(name, |n| {
-        target_tf.task(n).map(|t| t.requires.clone())
-    }) {
-        Ok(order) => order,
-        Err(e) => return text_result(format!("{e}"), true),
-    };
-
-    let task_file_dir = target_path.parent();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut out = String::new();
-    for step in &order {
-        let task = target_tf
-            .task(step)
-            .expect("a resolved name still exists in the target's file");
-        let step_args: &[String] = if step == name { &positional } else { &[] };
-        let values = match TaskFile::bind(task, step_args) {
-            Ok(v) => v,
-            Err(e) => {
-                out.push_str(&format!("{e}\n"));
-                return text_result(out, true);
-            }
-        };
-        let inv = match target_tf.invocation(task, &values, &cwd, task_file_dir) {
-            Ok(inv) => inv,
-            Err(e) => {
-                out.push_str(&format!("{e}\n"));
-                return text_result(out, true);
-            }
-        };
-        match std::process::Command::new(&inv.program)
-            .args(&inv.args)
-            .envs(inv.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(&inv.cwd)
-            .output()
-        {
-            Ok(o) => {
-                out.push_str(&String::from_utf8_lossy(&o.stdout));
-                out.push_str(&String::from_utf8_lossy(&o.stderr));
-                if !o.status.success() {
-                    out.push_str(&format!(
-                        "\n[task {step:?} exited with {}]\n",
-                        o.status.code().unwrap_or(-1)
-                    ));
-                    return text_result(out, true);
-                }
-            }
-            Err(e) => {
-                out.push_str(&format!("could not run {}: {e}\n", inv.program));
-                return text_result(out, true);
-            }
+    match mdtask_core::run_agent(files, name, &positional, &cwd) {
+        Ok(out) => {
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            text_result(text, !out.status.success())
         }
+        Err(e) => text_result(format!("{e}"), true),
     }
-    text_result(out, false)
 }
 
 #[cfg(test)]
@@ -286,10 +193,7 @@ mod tests {
             "tasks.md",
             "## open\n\nAgent: allow\n\n```sh\ntrue\n```\n\n## closed\n\n```sh\ntrue\n```\n",
         )]);
-        let names: Vec<_> = allowed(&f)
-            .iter()
-            .map(|(_, _, t)| t.name.as_str())
-            .collect();
+        let names: Vec<_> = agent_jobs(&f).iter().map(|j| j.name.as_str()).collect();
         assert_eq!(names, ["open"]);
     }
 
@@ -304,7 +208,7 @@ mod tests {
                 "## deploy\n\nAgent: allow\n\n```sh\ntrue\n```\n",
             ),
         ]);
-        assert!(allowed(&f).is_empty());
+        assert!(agent_jobs(&f).is_empty());
     }
 
     fn call_text(res: &Value) -> String {
