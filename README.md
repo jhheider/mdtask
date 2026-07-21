@@ -23,15 +23,15 @@ cargo build --release
 Render a note to PDF, in its own folder.
 
 Args: file
-Dir: {{ file }}
+Dir: dirname({{ file }})
 
 ```sh
-pandoc -t pdf -o "${file%md}pdf" "{{ file }}"
+pandoc -t pdf -o "${file%md}pdf" "$file"
 ```
 ```
 
 ```console
-$ mdtask                 # list tasks
+$ mdtask                 # list tasks (walks up the tree; see below)
 $ mdtask build           # run one
 $ mdtask pdf notes/a.md  # positional args fill `Args:` in order
 ```
@@ -68,17 +68,34 @@ grammar and makes no round-trip promise.
 - **Metadata** is `Key: value` lines in the task body (case-insensitive):
   - `Args:` — positional argument names. Passed on the CLI in order; prompted by
     an embedder. Substituted as `{{ name }}` in the script **and** exported as
-    `$name`, so `${name%md}`-style shell expansion works too.
-  - `Dir:` — the working directory (relative to the run root; may use `{{ arg }}`;
-    if it resolves to a file, its parent is used — the `[no-cd]` idea).
+    `$name`. Prefer **`$name`** in scripts — the shell quotes it (`"$name"` is
+    injection-safe, `${name%md}` works). **`{{ name }}` is raw text substitution**
+    (before the shell parses the script), so `"{{ name }}"` is *not* safe for
+    untrusted values; reserve `{{ }}` for `Dir:` and developer-authored templates.
+  - `Dir:` — the working directory (relative to the run root; may use `{{ arg }}`).
+    `dirname(PATH)` takes a path's **lexical** parent — `Dir: dirname({{ file }})`
+    runs in the file's folder (the `[no-cd]` idea) and works whether or not the
+    file exists yet. Resolution never touches the filesystem.
   - `Env:` — extra environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a
-    section heading is **hoisted** to every task.
+    section heading is **hoisted** to every task (regardless of position).
   - `Requires:` — task dependencies (parsed; sequencing is the caller's for now).
-  - `Agent: allow` — opt a task in to an MCP/agent surface. **Off by default**,
-    so handing a task file to an agent never exposes arbitrary shell.
+  - `Agent: allow` — opt a task in to an MCP/agent surface. **Off by default**;
+    a caller must filter with `TaskFile::agent_tasks()` (the enforcement point) so
+    handing a task file to an agent never exposes ungated shell.
 
 The parser is line-based (no CommonMark dependency), so a `#` or `Key:` inside a
-fenced block is never mistaken for structure.
+fenced block is never mistaken for structure. Parsing is infallible but records
+problems (an unterminated fence, a duplicate task, an unknown interpreter) in
+`TaskFile::warnings` — surface them rather than trusting silence.
+
+### Finding task files
+
+The CLI walks **up** from the current directory (like `make`/`just`/`xc`),
+taking the first `tasks.md` / `maskfile.md` / `README.md` in each ancestor that
+defines a task. Nearer files **shadow** farther ones by task name — like just's
+`set fallback` — so a project inherits a baseline of tasks from its parents and
+overrides them where it wants. (`mdtask-core::parse` itself does no filesystem
+access; an embedder with its own project root just calls it directly.)
 
 ## Embedding
 
