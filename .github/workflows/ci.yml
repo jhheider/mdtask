@@ -1,0 +1,25 @@
+name: CI
+
+# Thin caller over jhheider/rust-ci. mdtask is PRIVATE while building, so CI
+# routes to the self-hosted arm64 runner (studio-mdtask). At the first public
+# release, revert to the default hosted matrix (drop os/runs-on, add
+# `coverage: true`), publish mdtask-core + mdtask, and remove the gha-runner
+# service. See README.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE*", ".gitignore"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE*", ".gitignore"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: jhheider/rust-ci/.github/workflows/ci.yml@v1
+    with:
+      os: '["self-hosted"]'
+      runs-on: self-hosted
+    secrets: inherit

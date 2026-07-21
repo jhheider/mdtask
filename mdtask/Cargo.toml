@@ -1,0 +1,16 @@
+[package]
+name = "mdtask"
+version = "0.1.0"
+description = "Run tasks defined in markdown: mdtask <name> [args]. A thin CLI over mdtask-core."
+keywords = ["task", "runner", "markdown", "cli"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "../README.md"
+default-run = "mdtask"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mdtask-core = { version = "0.1", path = "../mdtask-core" }
