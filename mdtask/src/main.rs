@@ -6,7 +6,15 @@
 //! mdtask lint [TASK]       shellcheck the shell scripts (all tasks, or one)
 //! mdtask mcp               serve agent-allowed tasks to an MCP client (--features mcp)
 //! mdtask -f FILE ...       use a specific task file (no directory walk)
+//! mdtask -V / --version    print the version
+//! mdtask -h / --help       print this help
 //! ```
+//!
+//! `-V`/`--version` and `-h`/`--help` are honoured only in the first (subcommand)
+//! position, so `mdtask <task> --help` still forwards `--help` to the task, the
+//! way a task runner should. That is also why there is no arg-parser dependency:
+//! everything after the task name belongs to the task, which a real parser would
+//! fight to claim.
 //!
 //! A task with `Requires:` runs its dependencies first (resolved across the
 //! layered files, deps before dependents, aborting on the first failure).
@@ -27,8 +35,36 @@ mod lint;
 #[cfg(feature = "mcp")]
 mod mcp;
 
+/// Usage text for `-h`/`--help` (kept in sync with the module docs above).
+const HELP: &str = "\
+mdtask runs tasks defined in markdown (tasks.md / maskfile.md / README.md).
+
+Usage:
+  mdtask                    list the available tasks
+  mdtask <name> [args...]   run a task; positional args fill its `Args:` in order
+  mdtask lint [TASK]        shellcheck the shell scripts (all tasks, or one)
+  mdtask mcp                serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask -f, --file FILE    use a specific task file (no directory walk)
+  mdtask -V, --version      print the version
+  mdtask -h, --help         print this help
+";
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Version/help are recognised only in the first (subcommand) position, so
+    // `mdtask <task> --help` still forwards `--help` to the task.
+    match args.first().map(String::as_str) {
+        Some("-V" | "--version") => {
+            println!("mdtask {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some("-h" | "--help") => {
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
 
     // -f/--file FILE selects one task file (no walk); else walk up from cwd.
     let mut file: Option<PathBuf> = None;
