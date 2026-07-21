@@ -87,12 +87,15 @@ makes no round-trip promise.
     filesystem.
   - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
-  - `Requires:` lists task dependencies (parsed; sequencing is the caller's for
-    now).
+  - `Requires:` lists task dependencies. The CLI runs them first, resolved across
+    the layered files, dependencies before dependents, each once (a diamond runs
+    its shared dependency once), aborting on the first failure. A missing or
+    cyclic dependency is a hard error. Dependencies run with no positional args
+    (their defaults fill in); only the named target receives the CLI args.
   - `Agent: allow` opts a task in to an MCP or agent surface. It is **off by
     default**, and a caller must filter with `TaskFile::agent_tasks()` (the
     enforcement point), so handing a task file to an agent never exposes ungated
-    shell.
+    shell. See [MCP](#mcp).
 
 The parser is line-based (no CommonMark dependency), so a `#` or `Key:` inside a
 fenced block is never mistaken for structure. Parsing is infallible but records
@@ -117,6 +120,25 @@ non-shell interpreter; those are skipped with a note. mdtask does not bundle
 shellcheck: it finds one on your `PATH`, falls back to `pkgx shellcheck`, and
 otherwise tells you to install it. `SC2154` (referenced but not assigned) is
 suppressed, because mdtask exports args and `Env:` as shell variables.
+
+### MCP
+
+Built with `--features mcp`, `mdtask mcp` serves the working set to an MCP client
+(Claude Desktop or Code) over stdio, so an agent can run your tasks. It is **fail
+closed**: only tasks marked `Agent: allow` are exposed, everything else is
+invisible and unrunnable.
+
+- `list_tasks` enumerates **only** the allowed tasks, so the rest are not even
+  discoverable.
+- `run_task` re-checks the allowlist before running, so naming a hidden task
+  fails too. Its output is captured and returned as the tool result.
+- A `Requires:` dependency of an allowed task still runs (the author vouched for
+  the whole task when they wrote `Agent: allow`), but a dependency is never
+  listed and never independently callable: the gate is at the entry point the
+  agent controls, not every transitive step.
+
+The `mcp` feature is off by default, so a plain build pulls no JSON or server
+dependencies.
 
 ## Embedding
 
