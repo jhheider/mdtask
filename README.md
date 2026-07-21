@@ -3,7 +3,7 @@
 **An embeddable, execution-capable, markdown task runner for Rust.** Define your
 tasks in the same markdown you already write, whether a `tasks.md`, a
 `maskfile.md`, or a project `README.md`, and run them from a library, a CLI, or
-(later) an agent-safe MCP surface.
+an agent-safe MCP surface.
 
 ```markdown
 # Tasks
@@ -52,13 +52,13 @@ nothing that fit:
 
 So `mdtask` is the million-and-first task runner, with no apology. It collects
 the features I liked best from the others into a small, dependency-light **core
-library** (`mdtask-core`) that anything can embed. The CLI is a thin wrapper, and
-an MCP mode is a later afterthought. The library is the point.
+library** (`mdtask-core`) that anything can embed. The CLI and the feature-gated
+MCP server are thin wrappers over it. The library is the point.
 
 It is **not** compatible with any one of them. It borrows conventions (xc's clean
 `Key: value` metadata vocabulary, mask's per-fence interpreter and positional
-args) and reads many xc and mask task files as-is, but it owns its grammar and
-makes no round-trip promise.
+args), and a simple xc or mask task file often parses without changes, but it
+owns its grammar and makes no compatibility or round-trip promise.
 
 ## The format
 
@@ -91,7 +91,10 @@ makes no round-trip promise.
     the layered files, dependencies before dependents, each once (a diamond runs
     its shared dependency once), aborting on the first failure. A missing or
     cyclic dependency is a hard error. Dependencies run with no positional args
-    (their defaults fill in); only the named target receives the CLI args.
+    (their defaults fill in); only the named target receives the CLI args. Note
+    that dependencies **re-run on every invocation**: there is no `make`-style
+    "already satisfied" mtime or hash check, so `Requires:` is for ordering, not
+    for skipping work that is already done.
   - `Agent: allow` opts a task in to an MCP or agent surface. It is **off by
     default**, and a caller must filter with `TaskFile::agent_tasks()` (the
     enforcement point), so handing a task file to an agent never exposes ungated
@@ -166,9 +169,9 @@ render thread.
 
 ## Status
 
-Early. The core parser and invocation builder are solid and tested; the CLI is
-minimal; MCP is planned. In-tree consumers: [gloaming](https://github.com/jhheider/gloaming)
-and penknife.
+Early. The core parser and invocation builder are solid and tested; the CLI runs,
+lints, and serves MCP; a crates.io release is still pending. Intended consumers:
+[gloaming](https://github.com/jhheider/gloaming) and penknife.
 
 ## Credits
 
