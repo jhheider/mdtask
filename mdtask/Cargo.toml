@@ -1,6 +1,6 @@
 [package]
 name = "mdtask"
-version = "0.2.0"
+version = "0.3.0"
 description = "Run tasks defined in markdown: mdtask <name> [args]. A thin CLI over mdtask-core."
 keywords = ["task", "runner", "markdown", "cli"]
 categories = ["development-tools", "command-line-utilities"]
@@ -13,7 +13,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mdtask-core = { version = "0.2", path = "../mdtask-core" }
+mdtask-core = { version = "0.3", path = "../mdtask-core" }
 serde_json = { version = "1", optional = true }
 
 [features]

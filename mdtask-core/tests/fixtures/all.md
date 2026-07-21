@@ -6,10 +6,10 @@ Env: SHARED=base
 
 ## build
 
-Build the release binary.
+Stand-in for a real build (echo, so running it in a test stays hermetic).
 
 ```sh
-cargo build --release
+echo "building ($SHARED)"
 ```
 
 ## greet

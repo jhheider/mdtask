@@ -3,7 +3,6 @@
 //! ```text
 //! mdtask                 list tasks (walks up for tasks.md / maskfile.md / README.md)
 //! mdtask <name> [args...]  run a task; positional args fill its `Args:` in order
-//! mdtask lint [TASK]       shellcheck the shell scripts (all tasks, or one)
 //! mdtask mcp               serve agent-allowed tasks to an MCP client (--features mcp)
 //! mdtask -f FILE ...       use a specific task file (no directory walk)
 //! mdtask -V / --version    print the version
@@ -24,14 +23,15 @@
 //! from its parents and overrides them where it wants.
 //!
 //! The library is the point, so this is deliberately small, with no arg-parser
-//! dependency.
+//! dependency. All of the run mechanics (interpreter, argv, dependency order,
+//! spawn) live in `mdtask-core`; this binary just resolves files and calls
+//! `mdtask_core::run`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mdtask_core::{Task, TaskFile};
+use mdtask_core::{Job, RunError, TaskFile};
 
-mod lint;
 #[cfg(feature = "mcp")]
 mod mcp;
 
@@ -42,7 +42,6 @@ mdtask runs tasks defined in markdown (tasks.md / maskfile.md / README.md).
 Usage:
   mdtask                    list the available tasks
   mdtask <name> [args...]   run a task; positional args fill its `Args:` in order
-  mdtask lint [TASK]        shellcheck the shell scripts (all tasks, or one)
   mdtask mcp                serve agent-allowed tasks to an MCP client (needs `mcp`)
   mdtask -f, --file FILE    use a specific task file (no directory walk)
   mdtask -V, --version      print the version
@@ -97,7 +96,7 @@ fn main() -> ExitCode {
     }
     // Parse warnings are worth seeing (an unterminated fence mis-runs silently).
     for (path, tf) in &files {
-        for w in &tf.warnings {
+        for w in tf.warnings() {
             eprintln!("mdtask: {}: {w}", path.display());
         }
     }
@@ -106,87 +105,50 @@ fn main() -> ExitCode {
         return list(&files);
     };
 
-    // Reserved subcommands, checked before task dispatch. `lint` takes an optional
-    // task name; `mcp` serves the agent-allowed tasks over stdio.
-    if name == "lint" {
-        return lint::run(&files, args.get(1).map(String::as_str));
-    }
+    // The `mcp` subcommand serves the agent-allowed tasks over stdio; it is checked
+    // before task dispatch.
     if name == "mcp" {
         return run_mcp(&files);
     }
 
-    // Nearest file that defines a task wins (the fallback layering). This lookup
-    // resolves both the target and each `Requires:` dependency the same way.
-    let nearest = |n: &str| {
-        files
-            .iter()
-            .find_map(|(p, tf)| tf.task(n).map(|t| (p, tf, t)))
-    };
-
-    if nearest(&name).is_none() {
-        eprintln!("mdtask: no task named {name:?}");
-        return ExitCode::FAILURE;
-    }
-
-    // Resolve the `Requires:` chain: dependencies first, the target last, each
-    // task once. A missing or cyclic dependency is a hard error.
-    let order = match mdtask_core::dependency_order(&name, |n| {
-        nearest(n).map(|(_, _, t)| t.requires.clone())
-    }) {
-        Ok(order) => order,
-        Err(e) => {
-            eprintln!("mdtask: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     let positional: Vec<String> = args.iter().skip(1).cloned().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Run each task in order. Dependencies run with no positional args (their
-    // defaults fill in); only the named target receives the CLI args. Abort on the
-    // first non-zero exit, the way make stops a failing build.
-    for step in &order {
-        let (path, tf, task) = nearest(step).expect("a resolved name still exists");
-        let task_file_dir = path.parent().unwrap_or(Path::new("."));
-        let step_args: &[String] = if step == &name { &positional } else { &[] };
-
-        let values = match TaskFile::bind(task, step_args) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("mdtask: {e} (usage: mdtask {step} {})", usage(task));
-                return ExitCode::FAILURE;
-            }
-        };
-        let inv = match tf.invocation(task, &values, &cwd, Some(task_file_dir)) {
-            Ok(inv) => inv,
-            Err(e) => {
-                eprintln!("mdtask: {e} (usage: mdtask {step} {})", usage(task));
-                return ExitCode::FAILURE;
-            }
-        };
-        // Inherit stdio so the task's output streams straight through.
-        match std::process::Command::new(&inv.program)
-            .args(&inv.args)
-            .envs(inv.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(&inv.cwd)
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            // A failing child: surface a non-zero code. `code()` can exceed 255
-            // (Windows returns the full 32-bit code; POSIX has already masked to
-            // 8 bits), so clamp with `try_from` and never let it round to 0.
-            Ok(s) => {
-                let code = u8::try_from(s.code().unwrap_or(1)).unwrap_or(1).max(1);
-                return ExitCode::from(code);
-            }
-            Err(e) => {
-                eprintln!("mdtask: could not run {}: {e}", inv.program);
-                return ExitCode::FAILURE;
-            }
+    // Core owns the whole run: resolve the target and its `Requires:` chain across
+    // the layered files, then run each step (inheriting stdio), stopping on the
+    // first non-zero exit.
+    match mdtask_core::run(&files, &name, &positional, &cwd) {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        // A failing child: surface a non-zero code. `code()` can exceed 255
+        // (Windows returns the full 32-bit code; POSIX has already masked to
+        // 8 bits), so clamp with `try_from` and never let it round to 0.
+        Ok(status) => {
+            let code = u8::try_from(status.code().unwrap_or(1)).unwrap_or(1).max(1);
+            ExitCode::from(code)
+        }
+        Err(e) => {
+            report(&files, &name, &e);
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
+}
+
+/// Surface a `RunError` on stderr. `NotFound` and a missing argument get a tailored
+/// line (the latter with the task's usage); everything else prints its `Display`.
+fn report(files: &[(PathBuf, TaskFile)], name: &str, e: &RunError) {
+    match e {
+        RunError::NotFound(n) => eprintln!("mdtask: no task named {n:?}"),
+        RunError::MissingArg(_) => match job_named(files, name) {
+            Some(job) => eprintln!("mdtask: {e} (usage: mdtask {name} {})", usage(job)),
+            None => eprintln!("mdtask: {e}"),
+        },
+        _ => eprintln!("mdtask: {e}"),
+    }
+}
+
+/// The nearest definition of `name` across the layered files, for usage output.
+fn job_named<'a>(files: &'a [(PathBuf, TaskFile)], name: &str) -> Option<&'a Job> {
+    files.iter().find_map(|(_, tf)| tf.job(name))
 }
 
 /// Dispatch `mdtask mcp`. With the `mcp` feature, serve over stdio; without it,
@@ -207,12 +169,12 @@ fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
     let mut any = false;
     for (_, tf) in files {
-        for t in &tf.tasks {
-            if seen.insert(t.name.clone()) {
-                let args = usage(t);
-                let sep = if args.is_empty() { "" } else { " " };
-                let desc = t.description.lines().next().unwrap_or("");
-                println!("{}{sep}{args}\t{desc}", t.name);
+        for job in tf.jobs() {
+            if seen.insert(job.name.clone()) {
+                let a = usage(job);
+                let sep = if a.is_empty() { "" } else { " " };
+                let desc = job.description.lines().next().unwrap_or("");
+                println!("{}{sep}{a}\t{desc}", job.name);
                 any = true;
             }
         }
@@ -225,10 +187,10 @@ fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
     }
 }
 
-/// `<arg1> [arg2] [rest...]` for a task's declared args, for usage/list output:
+/// `<arg1> [arg2] [rest...]` for a job's declared args, for usage/list output:
 /// required args in angle brackets, defaulted/variadic in square brackets.
-fn usage(t: &Task) -> String {
-    t.args
+fn usage(job: &Job) -> String {
+    job.args
         .iter()
         .map(|a| {
             if a.variadic {
