@@ -74,12 +74,13 @@ overlap as a convenience, not a contract.
     **required**, `name='default'` is **optional** (that value when omitted), and
     a trailing `*name` is **variadic** (it collects the rest, space-joined). They
     are passed on the CLI in order, or prompted by an embedder. Each is
-    substituted as `{{ name }}` in the script **and** exported as `$name`. Prefer
-    **`$name`** in scripts, because the shell quotes it (`"$name"` is
-    injection-safe, and `${name%md}` works). **`{{ name }}` is raw text
-    substitution**, applied before the shell parses the script, so `"{{ name }}"`
-    is *not* safe for untrusted values. Reserve `{{ }}` for developer-authored
-    templates.
+    substituted as `{{ name }}` in the script **and** exported as `$name`.
+    **`{{ name }}` is raw text substitution**, spliced in before the interpreter
+    parses the script, so `{{ name }}` is *not* safe for untrusted values in any
+    language. The safe form is to **read the argument from the environment**, never
+    to template it: `"$name"` in a shell (the shell quotes it, and `${name%md}`
+    works), `os.environ["name"]` in Python, `process.env.name` in Node, and so on.
+    Reserve `{{ }}` for developer-authored templates.
   - `Opts:` carries per-task flags, space-separated. The one flag today is
     **`inherit-cwd`**: run the task in the directory you invoked mdtask from,
     instead of the default. Use it for a carry-around task that operates on a path
@@ -153,10 +154,11 @@ invisible and unrunnable.
   dependency and run its own code through an allowed entry point. The author who
   wrote `Agent: allow` vouched for their file's tasks, and only those run.
 - A task that interpolates an argument into its **script** via `{{ arg }}` is
-  **refused**: `{{ }}` is raw, unquoted substitution, so an agent-supplied value
-  would be shell-injectable. Expose such a task only after switching it to
-  `"$arg"`, which the shell quotes. (This applies to the target that receives the
-  agent's `args`; dependencies run with author-controlled defaults.)
+  **refused**: `{{ }}` is raw substitution, so an agent-supplied value would be
+  injectable. Expose such a task only after switching it to read the value from
+  the environment (`"$arg"` in a shell, `os.environ["arg"]` in Python, and so on).
+  (This applies to the target that receives the agent's `args`; dependencies run
+  with author-controlled defaults.)
 
 The `mcp` feature is off by default, so a plain build pulls no JSON or server
 dependencies.
