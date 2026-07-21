@@ -72,9 +72,10 @@ pub struct Task {
     /// Prefer `"$name"`, which the shell quotes, and reserve `{{ }}` for `Dir:`
     /// and developer-authored templates.
     pub args: Vec<Arg>,
-    /// `Requires:` names the tasks this one depends on. They are parsed only; the
-    /// caller sequences them, since mdtask-core does not run dependencies itself
-    /// yet.
+    /// `Requires:` names the tasks this one depends on. mdtask-core does not run
+    /// them (execution stays the caller's), but [`dependency_order`] resolves the
+    /// transitive run order (deps first, cycle and typo detected) so a caller can
+    /// run each in turn. The mdtask CLI does exactly that.
     pub requires: Vec<String>,
     /// `Agent: allow` opts a task in to being listed and run by an MCP or agent
     /// surface. It is advisory data: nothing in mdtask-core's execution path
@@ -115,6 +116,79 @@ impl std::fmt::Display for MissingArg {
     }
 }
 impl std::error::Error for MissingArg {}
+
+/// A `Requires:` dependency chain could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepError {
+    /// A `Requires:` named a task that does not exist.
+    Missing { task: String, required_by: String },
+    /// A dependency cycle, reported at the task where the back edge closes.
+    Cycle(String),
+}
+
+impl std::fmt::Display for DepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DepError::Missing { task, required_by } => {
+                write!(f, "task {required_by:?} requires unknown task {task:?}")
+            }
+            DepError::Cycle(name) => write!(f, "dependency cycle through task {name:?}"),
+        }
+    }
+}
+impl std::error::Error for DepError {}
+
+/// Resolve the run order for `target` and its transitive `Requires:`: each
+/// dependency comes before the task that needs it, `target` comes last, and every
+/// task appears at most once (a diamond runs its shared dependency once). This is
+/// the sequencing mdtask-core does not do inside `invocation`; the caller supplies
+/// `requires_of`, which returns a task's declared dependency names, or `None` if
+/// the name is not a known task (so a typo in `Requires:` is a hard error, not a
+/// silent skip). Pure: no filesystem or process access.
+pub fn dependency_order(
+    target: &str,
+    requires_of: impl Fn(&str) -> Option<Vec<String>>,
+) -> Result<Vec<String>, DepError> {
+    fn visit<F: Fn(&str) -> Option<Vec<String>>>(
+        name: &str,
+        required_by: &str,
+        requires_of: &F,
+        order: &mut Vec<String>,
+        done: &mut std::collections::BTreeSet<String>,
+        on_stack: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), DepError> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if !on_stack.insert(name.to_string()) {
+            return Err(DepError::Cycle(name.to_string()));
+        }
+        let deps = requires_of(name).ok_or_else(|| DepError::Missing {
+            task: name.to_string(),
+            required_by: required_by.to_string(),
+        })?;
+        for dep in &deps {
+            visit(dep, name, requires_of, order, done, on_stack)?;
+        }
+        on_stack.remove(name);
+        done.insert(name.to_string());
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    let mut order = Vec::new();
+    let mut done = std::collections::BTreeSet::new();
+    let mut on_stack = std::collections::BTreeSet::new();
+    visit(
+        target,
+        target,
+        &requires_of,
+        &mut order,
+        &mut done,
+        &mut on_stack,
+    )?;
+    Ok(order)
+}
 
 impl TaskFile {
     /// Find a task by name. The match is exact and case-sensitive, against the
@@ -800,6 +874,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inv.cwd, Path::new("/proj/out"));
+    }
+
+    // A `requires_of` for tests: a map from task name to its dependency names.
+    fn deps_of<'a>(map: &'a [(&str, &[&str])]) -> impl Fn(&str) -> Option<Vec<String>> + 'a {
+        move |name| {
+            map.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, ds)| ds.iter().map(|s| s.to_string()).collect())
+        }
+    }
+
+    #[test]
+    fn dependency_order_is_deps_first_target_last() {
+        // a -> b -> c, plus a -> c: c runs once, before b, and a is last.
+        let g = deps_of(&[("a", &["b", "c"]), ("b", &["c"]), ("c", &[])]);
+        assert_eq!(dependency_order("a", g).unwrap(), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn dependency_order_dedupes_a_diamond() {
+        let g = deps_of(&[("a", &["b", "c"]), ("b", &["d"]), ("c", &["d"]), ("d", &[])]);
+        let order = dependency_order("a", g).unwrap();
+        assert_eq!(order.iter().filter(|n| *n == "d").count(), 1);
+        // d before b and c; a last.
+        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+        assert!(pos("d") < pos("b") && pos("d") < pos("c"));
+        assert_eq!(order.last().unwrap(), "a");
+    }
+
+    #[test]
+    fn dependency_order_detects_a_cycle() {
+        let g = deps_of(&[("a", &["b"]), ("b", &["a"])]);
+        assert_eq!(dependency_order("a", g), Err(DepError::Cycle("a".into())));
+    }
+
+    #[test]
+    fn dependency_order_flags_a_missing_dependency() {
+        let g = deps_of(&[("a", &["ghost"])]);
+        assert_eq!(
+            dependency_order("a", g),
+            Err(DepError::Missing {
+                task: "ghost".into(),
+                required_by: "a".into(),
+            })
+        );
     }
 
     #[test]

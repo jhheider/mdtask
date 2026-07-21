@@ -14,3 +14,7 @@ authors.workspace = true
 
 [dependencies]
 mdtask-core = { version = "0.1", path = "../mdtask-core" }
+serde_json = { version = "1", optional = true }
+
+[features]
+mcp = ["dep:serde_json"]
