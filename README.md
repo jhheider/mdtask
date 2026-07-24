@@ -80,11 +80,12 @@ overlap as a convenience, not a contract.
     to template it: `"$name"` in a shell (the shell quotes it, and `${name%md}`
     works), `os.environ["name"]` in Python, `process.env.name` in Node, and so on.
     Reserve `{{ }}` for developer-authored templates.
-  - `Opts:` carries per-task flags, space-separated. The one flag today is
-    **`inherit-cwd`**: run the task in the directory you invoked mdtask from,
-    instead of the default. Use it for a carry-around task that operates on a path
-    relative to where you are (this is just's `[no-cd]`). An unrecognized flag is
+  - `Opts:` carries per-task flags, space-separated. An unrecognized flag is
     reported as a warning and ignored.
+    - **`inherit-cwd`**: run the task in the directory you invoked mdtask from,
+      instead of the default. Use it for a carry-around task that operates on a
+      path relative to where you are (this is just's `[no-cd]`).
+    - **`no-strict`**: turn off the shell strictness described below.
   - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
   - `Requires:` lists task dependencies. The CLI runs them first, resolved across
@@ -116,6 +117,32 @@ below, from the directory of the ancestor file that defined it). Add
 `Opts: inherit-cwd` for the exception: a carry-around task that should operate on
 a path relative to wherever you are. Anything more specific than those two anchors
 is a `cd` in the script.
+
+### Shell tasks stop at the first failure
+
+A shell task runs its whole fenced block as one script, so mdtask prepends
+`set -e` (plus `pipefail` for `bash` and `zsh`) unless you write
+`Opts: no-strict`.
+
+This matters more than it sounds. Without it, a failing early command is
+swallowed and the task exits with the status of the **last** command, which
+quietly turns a multi-step gate into one that cannot fail:
+
+```sh
+cargo fmt --all -- --check    # fails
+cargo test                    # passes
+                              # ...and the task reports success
+```
+
+`just` avoids this by running each line as its own recipe line and stopping at
+the first error. mdtask hands the block to a shell, so it asks the shell for the
+same behavior.
+
+Deliberately **not** `set -u`. Catching an unset variable is a lint rather than
+failure detection, and it changes the meaning of correct scripts: reading an
+optional variable is ordinary in a task file. Write it yourself if you want it.
+`pipefail` is skipped for plain `sh`, because it is not POSIX and dash rejects
+it. Non-shell tasks (`python`, `node`, `ruby`) get nothing injected.
 
 ### Finding task files
 
