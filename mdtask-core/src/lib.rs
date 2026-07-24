@@ -293,13 +293,31 @@ pub(crate) fn dependency_order(
 /// The `Opts:` flags mdtask recognizes. An `Opts:` value outside this set is
 /// recorded as a warning and otherwise ignored, so a file written for a newer
 /// mdtask does not hard-fail on an older one.
-pub(crate) const KNOWN_OPTS: &[&str] = &["inherit-cwd"];
+pub(crate) const KNOWN_OPTS: &[&str] = &["inherit-cwd", "no-strict"];
 
 impl Job {
     /// Whether this job opted into `Opts: inherit-cwd`: run it in the invocation
     /// directory rather than the default (the task file's own directory).
     pub(crate) fn inherits_cwd(&self) -> bool {
         self.opts.iter().any(|o| o == "inherit-cwd")
+    }
+
+    /// Whether shell strictness applies. On unless `Opts: no-strict`.
+    ///
+    /// Strict is the default because the failure modes are asymmetric. A strict
+    /// default fails loudly when an author did not expect it, and they add
+    /// `no-strict`. A lenient default fails SILENTLY: a shell runs the whole
+    /// fenced block as one script, so an early failure is swallowed and the task
+    /// exits with the status of the last command. That turns a multi-step gate
+    /// into one that cannot fail, and it will report success while `cargo fmt`
+    /// is failing inside it.
+    ///
+    /// The other evidence is that authors were already writing the prelude by
+    /// hand: every multi-step task in mdtask's own dogfood repos opened with
+    /// `set -euo pipefail`. When everyone writes the same first line, it belongs
+    /// in the tool.
+    pub(crate) fn is_strict(&self) -> bool {
+        !self.opts.iter().any(|o| o == "no-strict")
     }
 
     /// The declared argument names this job interpolates into its **script** via
@@ -374,6 +392,10 @@ impl TaskFile {
 
         let script = substitute(&job.script, &effective);
         let (program, flag) = interpreter(&job.lang);
+        let script = match strict_prelude(&job.lang) {
+            Some(prelude) if job.is_strict() => format!("{prelude}\n{script}"),
+            _ => script,
+        };
 
         // Env precedence: hoisted, then job, then args. Args win, being the most
         // specific, so `$name` resolves to the passed value.
@@ -656,6 +678,34 @@ fn interpreter(lang: &str) -> (&'static str, &'static str) {
         "ruby" => ("ruby", "-e"),
         "node" | "js" | "javascript" => ("node", "-e"),
         _ => ("sh", "-c"),
+    }
+}
+
+/// The strictness prelude for a language, if it has one.
+///
+/// Only shells, and only the settings that are about *detecting failure*, which
+/// is the task runner's job:
+///
+/// - `set -e` stops at the first failing command, so a gate cannot pass while a
+///   step inside it fails.
+/// - `pipefail` extends that through a pipeline, where the exit status would
+///   otherwise be the last stage's and a failing producer would go unnoticed.
+///
+/// Deliberately NOT `set -u`. Catching an unset variable is a lint rather than
+/// failure detection, and it changes the meaning of correct scripts: reading an
+/// optional variable is ordinary in a task file, and defaulting it to a hard
+/// error would break working tasks to catch a typo. Authors who want it can
+/// still write it themselves.
+///
+/// `pipefail` is not POSIX, so plain `sh` gets only `set -e`: dash rejects
+/// `set -o pipefail` outright, which would break every task on a Debian-ish
+/// `/bin/sh`. `fish` gets nothing, having neither the syntax nor the semantics,
+/// and non-shells are left alone entirely.
+fn strict_prelude(lang: &str) -> Option<&'static str> {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "" | "sh" | "shell" => Some("set -e"),
+        "bash" | "zsh" => Some("set -e\nset -o pipefail"),
+        _ => None,
     }
 }
 
@@ -1480,5 +1530,118 @@ mod tests {
             Err(RunError::NotAllowed(n)) => assert_eq!(n, "deploy"),
             other => panic!("expected NotAllowed, got {other:?}"),
         }
+    }
+    /// The bug this default exists to prevent: a shell runs the whole block as
+    /// one script, so without `set -e` a failing early step is swallowed and the
+    /// task exits with the status of the LAST command. A gate that cannot fail
+    /// is worse than no gate, because it is trusted.
+    #[test]
+    fn a_failing_early_step_fails_the_job() {
+        let tf = parse("## check\n\n```sh\nfalse\ntrue\n```\n");
+        let out = run_captured(
+            &[(PathBuf::from("tasks.md"), tf)],
+            "check",
+            &[],
+            Path::new("."),
+        )
+        .expect("runs");
+        assert!(
+            !out.status.success(),
+            "a job whose first command fails must not report success"
+        );
+    }
+
+    #[test]
+    fn no_strict_restores_the_old_lenient_behavior() {
+        let tf = parse("## check\n\nOpts: no-strict\n\n```sh\nfalse\ntrue\n```\n");
+        let out = run_captured(
+            &[(PathBuf::from("tasks.md"), tf)],
+            "check",
+            &[],
+            Path::new("."),
+        )
+        .expect("runs");
+        assert!(
+            out.status.success(),
+            "no-strict should exit with the last command's status"
+        );
+    }
+
+    #[test]
+    fn a_passing_job_is_unaffected() {
+        let tf = parse("## ok\n\n```sh\ntrue\necho fine\n```\n");
+        let out = run_captured(
+            &[(PathBuf::from("tasks.md"), tf)],
+            "ok",
+            &[],
+            Path::new("."),
+        )
+        .expect("runs");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("fine"));
+    }
+
+    /// Existing task files already open with `set -euo pipefail` by hand, so the
+    /// prelude has to be harmlessly redundant rather than conflicting.
+    #[test]
+    fn a_hand_written_prelude_still_works() {
+        let tf = parse("## ok\n\n```sh\nset -eu\necho fine\n```\n");
+        let out = run_captured(
+            &[(PathBuf::from("tasks.md"), tf)],
+            "ok",
+            &[],
+            Path::new("."),
+        )
+        .expect("runs");
+        assert!(out.status.success());
+    }
+
+    /// `pipefail` is not POSIX and dash rejects it outright, so plain `sh` must
+    /// not receive it or every task breaks on a Debian-ish /bin/sh.
+    #[test]
+    fn plain_sh_does_not_get_pipefail() {
+        assert_eq!(strict_prelude("sh"), Some("set -e"));
+        assert_eq!(strict_prelude(""), Some("set -e"));
+        assert!(strict_prelude("bash").unwrap().contains("pipefail"));
+        assert!(strict_prelude("zsh").unwrap().contains("pipefail"));
+    }
+
+    /// Injecting shell syntax into another language would be a syntax error, so
+    /// non-shells are left alone.
+    #[test]
+    fn non_shells_get_no_prelude() {
+        for lang in ["python", "ruby", "node", "fish"] {
+            assert_eq!(
+                strict_prelude(lang),
+                None,
+                "{lang} must not be given shell syntax"
+            );
+        }
+    }
+
+    /// A python job still runs, which is the real check that the prelude is not
+    /// being spliced into a language that cannot parse it.
+    #[test]
+    fn a_python_job_is_untouched() {
+        let tf = parse("## py\n\n```python\nprint(\"hi\")\n```\n");
+        let out = run_captured(
+            &[(PathBuf::from("tasks.md"), tf)],
+            "py",
+            &[],
+            Path::new("."),
+        )
+        .expect("runs");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+    }
+
+    #[test]
+    fn no_strict_is_a_known_opt_and_warns_no_one() {
+        let tf = parse("## t\n\nOpts: no-strict\n\n```sh\ntrue\n```\n");
+        assert!(
+            tf.warnings().is_empty(),
+            "no-strict must be recognized: {:?}",
+            tf.warnings()
+        );
     }
 }
