@@ -46,6 +46,7 @@ Usage:
   mdtask mcp                the same, unless a task is named `mcp`, which wins
   mdtask -s, --show NAME    print a task's script and metadata without running it
   mdtask -f, --file FILE    use a specific task file (no directory walk)
+  mdtask --completions SH   print a completion script (bash, zsh, fish)
   mdtask -V, --version      print the version
   mdtask -h, --help         print this help
 ";
@@ -63,6 +64,15 @@ fn main() -> ExitCode {
         Some("-h" | "--help") => {
             print!("{HELP}");
             return ExitCode::SUCCESS;
+        }
+        // Emitted rather than checked in, and before the task files are even
+        // looked for: printing a completion script must work anywhere.
+        Some("--completions") => {
+            let Some(shell) = args.get(1) else {
+                eprintln!("mdtask: --completions needs a shell (bash, zsh, fish)");
+                return ExitCode::FAILURE;
+            };
+            return completions(shell);
         }
         _ => {}
     }
@@ -484,6 +494,114 @@ fn indent(pad: &str, line: &str) -> String {
     }
 }
 
+/// Completion scripts, emitted by the binary rather than checked in.
+///
+/// They ask `mdtask` for the task list at completion time rather than baking
+/// names in, which is the only thing that works here: the tasks are whatever the
+/// markdown in the current directory says they are, and they change without the
+/// completion script changing. That is why the piped listing is one
+/// tab-separated line per task with the description after the tab; these scripts
+/// are its consumer, so that format is load-bearing.
+fn completions(shell: &str) -> ExitCode {
+    let script = match shell {
+        "bash" => BASH_COMPLETIONS,
+        "zsh" => ZSH_COMPLETIONS,
+        "fish" => FISH_COMPLETIONS,
+        other => {
+            eprintln!("mdtask: no completions for {other:?} (bash, zsh, fish)");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{script}");
+    ExitCode::SUCCESS
+}
+
+/// `mdtask --completions bash > /etc/bash_completion.d/mdtask`
+const BASH_COMPLETIONS: &str = r#"# mdtask completions for bash.
+# Install: mdtask --completions bash > /usr/local/etc/bash_completion.d/mdtask
+_mdtask() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Flags taking a path, and one taking a task name.
+    case "$prev" in
+        -f|--file) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -s|--show) COMPREPLY=($(compgen -W "$(_mdtask_names)" -- "$cur")); return ;;
+    esac
+
+    # Only the first word is a task name; everything after it is the task's own,
+    # and mdtask cannot know what those mean.
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$(_mdtask_names) --show --file --mcp --help --version" -- "$cur"))
+    fi
+}
+
+# The task list comes from mdtask itself: tasks are whatever the markdown in this
+# directory says, so nothing can be baked in. stdout is a pipe here, so the
+# listing is one tab-separated line per task.
+_mdtask_names() {
+    mdtask 2>/dev/null | cut -f1 | cut -d' ' -f1
+}
+
+complete -F _mdtask mdtask
+"#;
+
+/// `mdtask --completions zsh > "${fpath[1]}/_mdtask"`
+const ZSH_COMPLETIONS: &str = r#"#compdef mdtask
+# mdtask completions for zsh.
+# Install: mdtask --completions zsh > "${fpath[1]}/_mdtask"
+
+_mdtask() {
+    local -a tasks
+    local line name desc
+
+    # Ask mdtask for the tasks: they are whatever the markdown here says, so
+    # nothing can be baked in. Piped, the listing is `name<TAB>description`, and
+    # zsh shows the description beside each candidate.
+    mdtask 2>/dev/null | while IFS=$'\t' read -r name desc; do
+        # Strip the argument usage, leaving the bare task name.
+        tasks+=("${name%% *}:${desc}")
+    done
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[print help]' \
+        '(-V --version)'{-V,--version}'[print the version]' \
+        '(-f --file)'{-f,--file}'[use a specific task file]:file:_files' \
+        '(-s --show)'{-s,--show}'[print a task without running it]:task:->task' \
+        '--mcp[serve agent-allowed tasks over MCP]' \
+        '1:task:->task' \
+        '*::arguments:_default'
+
+    # Only the first word is a task name; the rest belong to the task itself.
+    case "$state" in
+        task) _describe -t tasks 'task' tasks ;;
+    esac
+}
+
+_mdtask "$@"
+"#;
+
+/// `mdtask --completions fish > ~/.config/fish/completions/mdtask.fish`
+const FISH_COMPLETIONS: &str = r#"# mdtask completions for fish.
+# Install: mdtask --completions fish > ~/.config/fish/completions/mdtask.fish
+
+# The task list comes from mdtask itself, since tasks are whatever the markdown
+# in this directory says. Piped, the listing is `name<TAB>description`, which is
+# already the format fish wants for a candidate with a description.
+function __mdtask_tasks
+    mdtask 2>/dev/null | string replace -r '^(\S+)[^\t]*\t?' '$1\t'
+end
+
+# Only the first word is a task name; the rest belong to the task.
+complete -c mdtask -f -n __fish_is_first_arg -a '(__mdtask_tasks)'
+complete -c mdtask -f -n __fish_is_first_arg -s h -l help -d 'print help'
+complete -c mdtask -f -n __fish_is_first_arg -s V -l version -d 'print the version'
+complete -c mdtask -F -n __fish_is_first_arg -s f -l file -d 'use a specific task file'
+complete -c mdtask -f -n __fish_is_first_arg -s s -l show -d 'print a task without running it' -a '(__mdtask_tasks)'
+complete -c mdtask -f -n __fish_is_first_arg -l mcp -d 'serve agent-allowed tasks over MCP'
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +609,26 @@ mod tests {
     /// The bug this replaced: a listing showed the first *physical* line of a
     /// hard-wrapped markdown paragraph, which ends wherever the author's editor
     /// happened to wrap. Real output read "One license only permits one".
+    /// Each script must actually ask `mdtask` for the task list rather than
+    /// baking names in. Tasks are whatever the markdown in the current directory
+    /// says they are, so a script with a fixed list is wrong the moment someone
+    /// adds a task, and wrong in a different directory immediately.
+    #[test]
+    fn every_completion_script_queries_mdtask_at_completion_time() {
+        for script in [BASH_COMPLETIONS, ZSH_COMPLETIONS, FISH_COMPLETIONS] {
+            assert!(script.contains("mdtask 2>/dev/null"), "{script}");
+        }
+    }
+
+    /// The piped listing is `name<TAB>description`, and these scripts are its
+    /// consumer, so the tab is load-bearing. Verified against real bash, zsh,
+    /// and fish; this guards the shape they parse.
+    #[test]
+    fn the_shells_that_show_descriptions_split_on_the_tab() {
+        assert!(ZSH_COMPLETIONS.contains("IFS=$'\\t'"), "{ZSH_COMPLETIONS}");
+        assert!(FISH_COMPLETIONS.contains("\\t"), "{FISH_COMPLETIONS}");
+    }
+
     #[test]
     fn indent_leaves_a_blank_line_blank() {
         assert_eq!(indent("    ", "echo hi"), "    echo hi");

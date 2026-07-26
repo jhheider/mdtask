@@ -207,6 +207,18 @@ optional variable is ordinary in a task file. Write it yourself if you want it.
 `pipefail` is skipped for plain `sh`, because it is not POSIX and dash rejects
 it. Non-shell tasks (`python`, `node`, `ruby`) get nothing injected.
 
+### Completions
+
+```sh
+mdtask --completions zsh  > "${fpath[1]}/_mdtask"
+mdtask --completions bash > /usr/local/etc/bash_completion.d/mdtask
+mdtask --completions fish > ~/.config/fish/completions/mdtask.fish
+```
+
+The scripts ask `mdtask` for the task list at completion time rather than baking
+names in, since the tasks are whatever the markdown in the current directory
+says. zsh and fish show each task's description beside its name.
+
 ### Finding task files
 
 The CLI looks for `tasks.md`, `maskfile.md`, or `README.md` in the current
