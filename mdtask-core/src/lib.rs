@@ -49,6 +49,9 @@ pub struct TaskFile {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) jobs: Vec<Job>,
     pub(crate) warnings: Vec<String>,
+    /// File-level `Opts:`, set before the first task heading. Currently just
+    /// `include-parent`; see [`find_task_files`].
+    pub(crate) opts: Vec<String>,
 }
 
 /// One job: a named script with its metadata. The script, its interpreter
@@ -346,6 +349,9 @@ pub(crate) struct Step {
 /// mdtask does not hard-fail on an older one.
 pub(crate) const KNOWN_OPTS: &[&str] = &["inherit-cwd", "no-strict"];
 
+/// `Opts:` flags that only mean something at file level, before the first task.
+pub(crate) const KNOWN_FILE_OPTS: &[&str] = &["include-parent"];
+
 impl Job {
     /// Whether this job opted into `Opts: inherit-cwd`: run it in the invocation
     /// directory rather than the default (the task file's own directory).
@@ -398,6 +404,13 @@ impl TaskFile {
     /// The jobs in this file, in document order.
     pub fn jobs(&self) -> &[Job] {
         &self.jobs
+    }
+
+    /// Whether this file declared `Opts: include-parent` before its first task
+    /// heading, asking [`find_task_files`] to keep walking up and layer the
+    /// parent's tasks underneath its own.
+    pub fn includes_parent(&self) -> bool {
+        self.opts.iter().any(|o| o == "include-parent")
     }
 
     /// Find a job by name. The match is exact and case-sensitive, against the
@@ -941,6 +954,7 @@ pub fn parse(src: &str) -> TaskFile {
             line,
             cur.as_mut(),
             &mut file.env,
+            &mut file.opts,
             &mut file.warnings,
             block_start,
         );
@@ -1021,11 +1035,26 @@ fn is_closing_fence(line: &str, marker: &str) -> bool {
     t.len() >= 3 && t.bytes().all(|b| b == ch)
 }
 
-/// Search for task files from `start` up to the filesystem root, **nearest
-/// first**. In each ancestor directory the first of `tasks.md`, `maskfile.md`,
-/// `README.md` that parses to at least one job is taken. The CLI layers these
-/// child-first, so a nearer file shadows a farther one by job name (like just's
-/// `set fallback`, letting a project inherit a baseline of jobs from a parent).
+/// Search for task files from `start` upward, **nearest first**. In each
+/// directory the first of `tasks.md`, `maskfile.md`, `README.md` that parses to
+/// at least one job is taken.
+///
+/// **The walk stops at the first file found**, unless that file opts in with a
+/// file-level `Opts: include-parent` before its first task heading. A file that
+/// opts in is layered under by its own parent, on the same terms, so a chain
+/// continues only as far as every link agrees.
+///
+/// Inheritance has to be opt-in because the walk previously ran to the
+/// filesystem root, and every file it passed could define or *shadow* a task
+/// name. Running `mdtask build` in a freshly cloned repository could therefore
+/// run a script from a directory above it, chosen by a file the caller never
+/// looked at and quite possibly did not know existed. Stopping at the first file
+/// means what runs is what is written in the file you can see from where you are
+/// standing, and a project that genuinely wants a shared baseline says so.
+///
+/// Where layering does happen, it is child-first: a nearer file shadows a
+/// farther one by job name, like just's `set fallback`.
+///
 /// Embedders with their own project root can ignore this and call [`parse`].
 pub fn find_task_files(start: &Path) -> Vec<(PathBuf, TaskFile)> {
     let mut found = Vec::new();
@@ -1035,7 +1064,11 @@ pub fn find_task_files(start: &Path) -> Vec<(PathBuf, TaskFile)> {
             if let Some(src) = read_candidate(&path, depth == 0) {
                 let tf = parse(&src);
                 if !tf.jobs.is_empty() {
+                    let inherits = tf.includes_parent();
                     found.push((path, tf));
+                    if !inherits {
+                        return found;
+                    }
                     break; // one file per directory
                 }
             }
@@ -1308,6 +1341,7 @@ fn apply_line(
     line: &str,
     job: Option<&mut Job>,
     file_env: &mut Vec<(String, String)>,
+    file_opts: &mut Vec<String>,
     warnings: &mut Vec<String>,
     block_start: bool,
 ) -> bool {
@@ -1334,18 +1368,37 @@ fn apply_line(
                 return true;
             }
             "opts" | "options" => {
-                if let Some(t) = job {
-                    // Extend, not assign. Assigning meant a second `Opts:` line
-                    // silently erased the first, and a second `Requires:` line
-                    // silently dropped a dependency while still exiting 0.
-                    t.opts.extend(value.split_whitespace().map(str::to_string));
-                    for flag in &t.opts {
-                        if !KNOWN_OPTS.contains(&flag.as_str()) {
+                let Some(t) = job else {
+                    // Before the first heading: a file-level option, which is a
+                    // different vocabulary from a task's.
+                    for flag in value.split_whitespace() {
+                        if KNOWN_FILE_OPTS.contains(&flag) {
+                            file_opts.push(flag.to_string());
+                        } else {
                             warnings.push(format!(
-                                "unknown option {flag:?} in `Opts:` (known: {})",
-                                KNOWN_OPTS.join(", ")
+                                "unknown file-level option {flag:?} in `Opts:` (known: {}); \
+                                 a task option belongs under a task heading",
+                                KNOWN_FILE_OPTS.join(", ")
                             ));
                         }
+                    }
+                    return true;
+                };
+                // Extend, not assign. Assigning meant a second `Opts:` line
+                // silently erased the first, and a second `Requires:` line
+                // silently dropped a dependency while still exiting 0.
+                t.opts.extend(value.split_whitespace().map(str::to_string));
+                for flag in &t.opts {
+                    if !KNOWN_OPTS.contains(&flag.as_str()) {
+                        let hint = if KNOWN_FILE_OPTS.contains(&flag.as_str()) {
+                            "; that one is file-level, so it goes before the first task heading"
+                        } else {
+                            ""
+                        };
+                        warnings.push(format!(
+                            "unknown option {flag:?} in `Opts:` (known: {}){hint}",
+                            KNOWN_OPTS.join(", ")
+                        ));
                     }
                 }
                 return true;
@@ -2191,7 +2244,7 @@ true
         .unwrap();
         std::fs::write(
             child.join("tasks.md"),
-            "## shared\n\n```sh\necho child\n```\n\n## only\n\n```sh\ntrue\n```\n",
+            "Opts: include-parent\n\n## shared\n\n```sh\necho child\n```\n\n## only\n\n```sh\ntrue\n```\n",
         )
         .unwrap();
 
@@ -2206,6 +2259,83 @@ true
         // The parent still supplies `base` as an inherited baseline.
         assert!(files[1].1.job("base").is_some());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The default, and the reason inheritance became opt-in. The walk used to
+    /// run to the filesystem root, and every file it passed could define or
+    /// *shadow* a task name, so `mdtask build` in a fresh clone could run a
+    /// script from a directory above it that the caller never looked at.
+    #[test]
+    fn the_walk_stops_at_the_first_file_by_default() {
+        let base = std::env::temp_dir().join(format!("mdtask-stop-{}", std::process::id()));
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(
+            base.join("tasks.md"),
+            "## build\n\n```sh\necho hijacked\n```\n",
+        )
+        .unwrap();
+        std::fs::write(child.join("tasks.md"), "## only\n\n```sh\ntrue\n```\n").unwrap();
+
+        let files = find_task_files(&child);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(files.len(), 1, "the parent is not consulted");
+        assert!(
+            files[0].1.job("build").is_none(),
+            "and cannot supply a name"
+        );
+    }
+
+    /// A chain continues only as far as every link agrees: the middle file opts
+    /// in, the top one does not, so the walk takes the top file and stops there
+    /// rather than continuing past it.
+    #[test]
+    fn opting_in_is_per_file_all_the_way_up() {
+        let base = std::env::temp_dir().join(format!("mdtask-chain-{}", std::process::id()));
+        let mid = base.join("mid");
+        let leaf = mid.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(base.join("tasks.md"), "## top\n\n```sh\ntrue\n```\n").unwrap();
+        std::fs::write(
+            mid.join("tasks.md"),
+            "Opts: include-parent\n\n## middle\n\n```sh\ntrue\n```\n",
+        )
+        .unwrap();
+        std::fs::write(
+            leaf.join("tasks.md"),
+            "Opts: include-parent\n\n## leaf\n\n```sh\ntrue\n```\n",
+        )
+        .unwrap();
+
+        let files = find_task_files(&leaf);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(files.len(), 3, "leaf, mid, top");
+        assert!(files[2].1.job("top").is_some());
+    }
+
+    #[test]
+    fn a_task_option_at_file_level_says_where_it_belongs() {
+        let tf = parse("Opts: inherit-cwd\n\n## t\n\n```sh\ntrue\n```\n");
+        assert!(!tf.includes_parent());
+        assert!(
+            tf.warnings
+                .iter()
+                .any(|w| w.contains("task option belongs")),
+            "warnings: {:?}",
+            tf.warnings
+        );
+    }
+
+    #[test]
+    fn a_file_option_under_a_task_says_where_it_belongs() {
+        let tf = parse("## t\n\nOpts: include-parent\n\n```sh\ntrue\n```\n");
+        assert!(
+            tf.warnings.iter().any(|w| w.contains("file-level")),
+            "warnings: {:?}",
+            tf.warnings
+        );
     }
 
     /// A FIFO named `tasks.md` in an ancestor directory used to hang every

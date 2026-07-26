@@ -32,7 +32,7 @@ pandoc -t pdf -o "${file%md}pdf" "$file"
 ```
 
 ```console
-$ mdtask                 # list tasks (walks up the tree; see below)
+$ mdtask                 # list tasks (see "Finding task files" below)
 $ mdtask build           # run one
 $ mdtask pdf notes/a.md  # positional args fill `Args:` in order
 ```
@@ -92,6 +92,14 @@ overlap as a convenience, not a contract.
       instead of the default. Use it for a carry-around task that operates on a
       path relative to where you are (this is just's `[no-cd]`).
     - **`no-strict`**: turn off the shell strictness described below.
+
+    Before the first task heading, `Opts:` sets **file-level** options instead,
+    which are a separate vocabulary:
+
+    - **`include-parent`**: keep walking up and layer the parent's tasks under
+      this file's own. See [Finding task files](#finding-task-files).
+
+    Using one where the other belongs warns and says which way round it goes.
   - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
   - `Requires:` lists task dependencies, comma-separated. The CLI runs them
@@ -198,12 +206,37 @@ it. Non-shell tasks (`python`, `node`, `ruby`) get nothing injected.
 
 ### Finding task files
 
-The CLI walks **up** from the current directory (like `make`, `just`, and `xc`),
-taking the first `tasks.md`, `maskfile.md`, or `README.md` in each ancestor that
-defines a task. Nearer files **shadow** farther ones by task name, like just's
-`set fallback`, so a project inherits a baseline of tasks from its parents and
-overrides them where it wants. (`mdtask-core::parse` itself does no filesystem
-access; an embedder with its own project root just calls it directly.)
+The CLI looks for `tasks.md`, `maskfile.md`, or `README.md` in the current
+directory, taking the first one that defines a task, and **stops there**.
+
+A file can ask to inherit from above with a file-level option, before its first
+task heading:
+
+```markdown
+# my project
+
+Opts: include-parent
+
+## build
+...
+```
+
+Then the walk continues up (like `make`, `just`, and `xc`), and nearer files
+**shadow** farther ones by task name, like just's `set fallback`, so a project
+inherits a baseline of tasks from its parents and overrides them where it wants.
+Each file up the chain decides for itself, so the chain continues only as far as
+every link agrees.
+
+Inheritance is opt-in because it used to be unconditional and run to the
+filesystem root. Every file the walk passed could define **or shadow** a task
+name, so `mdtask build` in a freshly cloned repository could run a script from a
+directory above it, chosen by a file the caller never looked at. Stopping at the
+first file means what runs is what is written in the file you can see from where
+you are standing. (Changed in 0.5; before that, every ancestor was layered in
+automatically.)
+
+(`mdtask-core::parse` itself does no filesystem access; an embedder with its own
+project root just calls it directly.)
 
 ### MCP
 
