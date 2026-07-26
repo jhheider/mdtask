@@ -43,6 +43,7 @@ Usage:
   mdtask                    list the available tasks
   mdtask <name> [args...]   run a task; positional args fill its `Args:` in order
   mdtask mcp                serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask -s, --show NAME    print a task's script and metadata without running it
   mdtask -f, --file FILE    use a specific task file (no directory walk)
   mdtask -V, --version      print the version
   mdtask -h, --help         print this help
@@ -83,6 +84,19 @@ fn main() -> ExitCode {
         args.remove(0);
     }
 
+    // --show NAME: print the task instead of running it. After -f, so
+    // `mdtask -f other.md --show build` works, and leading-position-only like
+    // every other flag, so a task's own `--show` still reaches the task.
+    let mut show_name: Option<String> = None;
+    if matches!(args.first().map(String::as_str), Some("-s" | "--show")) {
+        if args.len() < 2 {
+            eprintln!("mdtask: {} needs a task name", args[0]);
+            return ExitCode::FAILURE;
+        }
+        show_name = Some(args.remove(1));
+        args.remove(0);
+    }
+
     // Discover the layered task files, nearest first.
     let files: Vec<(PathBuf, TaskFile)> = match file {
         Some(p) => match std::fs::read_to_string(&p) {
@@ -106,6 +120,10 @@ fn main() -> ExitCode {
         for w in tf.warnings() {
             eprintln!("mdtask: {}: {w}", path.display());
         }
+    }
+
+    if let Some(name) = show_name {
+        return show(&files, &name);
     }
 
     let Some(name) = args.first().cloned() else {
@@ -374,6 +392,83 @@ fn usage(job: &Job) -> String {
         .join(" ")
 }
 
+/// Print everything about a task without running it: where it is defined, what
+/// it declares, and the script itself.
+///
+/// A task runner runs shell that someone else wrote, quite possibly in a file
+/// you have not opened, and until now the only way to find out what `mdtask
+/// deploy` would do was to run `mdtask deploy`. That is a poor trade to offer.
+fn show(files: &[(PathBuf, TaskFile)], name: &str) -> ExitCode {
+    let Some((path, job)) = files
+        .iter()
+        .find_map(|(p, tf)| tf.job(name).map(|j| (p, j)))
+    else {
+        eprintln!("mdtask: no task named {name:?}");
+        return ExitCode::FAILURE;
+    };
+
+    println!("{}", invocation_usage(name, job));
+    println!("  from  {}", display_path(path));
+
+    let lang = if job.lang().is_empty() {
+        "(unlabeled fence, runs as sh)".to_string()
+    } else {
+        job.lang().to_string()
+    };
+    println!("  runs  {lang}");
+
+    if !job.opts().is_empty() {
+        println!("  opts  {}", job.opts().join(" "));
+    }
+    for (k, v) in job.env() {
+        println!("  env   {k}={v}");
+    }
+    if !job.requires.is_empty() {
+        // These run first, in order, and each may pull in dependencies of its
+        // own; what is printed is what this task declares, not the flattened
+        // chain.
+        let deps: Vec<String> = job
+            .requires
+            .iter()
+            .map(|r| {
+                if r.args.is_empty() {
+                    r.name.clone()
+                } else {
+                    format!("{} {}", r.name, r.args.join(" "))
+                }
+            })
+            .collect();
+        println!("  first {}", deps.join(", "));
+    }
+    if job.agent_allow {
+        println!("  agent allowed (an MCP or agent surface may run this)");
+    }
+
+    let desc = job.description.trim();
+    if !desc.is_empty() {
+        println!();
+        for line in desc.lines() {
+            println!("{}", indent("  ", line));
+        }
+    }
+
+    println!();
+    for line in job.script().lines() {
+        println!("{}", indent("    ", line));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Indent a line, leaving a blank one blank rather than turning it into
+/// trailing whitespace.
+fn indent(pad: &str, line: &str) -> String {
+    if line.is_empty() {
+        String::new()
+    } else {
+        format!("{pad}{line}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +476,12 @@ mod tests {
     /// The bug this replaced: a listing showed the first *physical* line of a
     /// hard-wrapped markdown paragraph, which ends wherever the author's editor
     /// happened to wrap. Real output read "One license only permits one".
+    #[test]
+    fn indent_leaves_a_blank_line_blank() {
+        assert_eq!(indent("    ", "echo hi"), "    echo hi");
+        assert_eq!(indent("    ", ""), "", "not four spaces of nothing");
+    }
+
     #[test]
     fn summary_unwraps_the_first_paragraph() {
         let desc = "Start the local dev server. One license only permits one\n\

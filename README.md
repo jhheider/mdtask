@@ -35,6 +35,7 @@ pandoc -t pdf -o "${file%md}pdf" "$file"
 $ mdtask                 # list tasks (see "Finding task files" below)
 $ mdtask build           # run one
 $ mdtask pdf notes/a.md  # positional args fill `Args:` in order
+$ mdtask --show build    # print what a task will run, without running it
 ```
 
 ## Why this exists (honestly)

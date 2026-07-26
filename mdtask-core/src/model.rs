@@ -226,6 +226,34 @@ pub(crate) const KNOWN_OPTS: &[&str] = &["inherit-cwd", "no-strict"];
 pub(crate) const KNOWN_FILE_OPTS: &[&str] = &["include-parent"];
 
 impl Job {
+    /// The script body, verbatim: the contents of the first fenced block under
+    /// the heading, before any argument substitution.
+    ///
+    /// Public so a consumer can show a task before running it. Knowing what a
+    /// task will do should not require running it, and for a tool whose job is
+    /// executing shell that is the difference between a considered decision and
+    /// a leap of faith.
+    pub fn script(&self) -> &str {
+        &self.script
+    }
+
+    /// The fenced block's info string, which selects the interpreter. Empty
+    /// means an unlabeled fence, which runs as `sh`.
+    pub fn lang(&self) -> &str {
+        &self.lang
+    }
+
+    /// The task's `Opts:` flags, in the order declared.
+    pub fn opts(&self) -> &[String] {
+        &self.opts
+    }
+
+    /// The task's own `Env:` pairs. Does not include the file-level `Env:`
+    /// hoisted to every task, which belongs to the file, not the job.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
     /// Whether this job opted into `Opts: inherit-cwd`: run it in the invocation
     /// directory rather than the default (the task file's own directory).
     pub(crate) fn inherits_cwd(&self) -> bool {
