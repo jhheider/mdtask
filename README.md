@@ -134,9 +134,32 @@ cargo test                    # passes
                               # ...and the task reports success
 ```
 
-`just` avoids this by running each line as its own recipe line and stopping at
-the first error. mdtask hands the block to a shell, so it asks the shell for the
-same behavior.
+`just` avoids this in its *default* mode by running each line as its own recipe
+line and stopping at the first error. Its shebang recipes, like xc and a
+multi-line Taskfile `cmd:`, run the whole body as one script and do **not** add
+strictness: there, writing `set -euo pipefail` yourself is the author's job.
+mdtask hands the block to a shell too, so it asks the shell for that behavior on
+your behalf instead.
+
+Which language counts as a shell is decided by the fence tag. `sh`, `shell`,
+`bash`, `zsh` and an untagged fence all get a prelude. `fish` does not: it has
+neither `set -e` nor `set -o pipefail`, so a multi-step fish task exits with the
+status of its **last** command and you must check `$status` yourself. Neither do
+`python`, `ruby` or `node`, which raise on error already.
+
+A tag mdtask does not recognize (`console`, `shell-session`, `bash5`) falls back
+to `sh` **with** the prelude, and the parse warns you it did. The fallback is
+deliberate, since those tags are usually a shell anyway, but it is a guess:
+a fence that is not a shell script at all will fail on its first line rather
+than be skipped. If mdtask is reading a `README.md`, that is the behavior to
+expect from your ```toml and ```json examples, and the reason to keep tasks in a
+`tasks.md` once a project has more than a couple.
+
+> Getting this wrong is how the guarantee above became untrue for a while: the
+> fallback resolved to `sh` while its prelude resolved to *nothing*, so a
+> ```console block ran unstrict and a failing step exited 0. One table now
+> answers both questions, and a test asserts that anything running a shell
+> carries failure detection.
 
 Deliberately **not** `set -u`. Catching an unset variable is a lint rather than
 failure detection, and it changes the meaning of correct scripts: reading an

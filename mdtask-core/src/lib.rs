@@ -391,8 +391,12 @@ impl TaskFile {
         }
 
         let script = substitute(&job.script, &effective);
-        let (program, flag) = interpreter(&job.lang);
-        let script = match strict_prelude(&job.lang) {
+        // An unrecognized language resolves to a *strict* sh, never a bare one:
+        // the bare fallback is what let a ```console block report success on a
+        // failing step. The parser has already warned that this is happening.
+        let lang = interpreter(&job.lang);
+        let (program, flag) = (lang.program, lang.flag);
+        let script = match lang.prelude {
             Some(prelude) if job.is_strict() => format!("{prelude}\n{script}"),
             _ => script,
         };
@@ -668,45 +672,77 @@ impl Invocation {
 
 /// Map a fence language to `(program, code-flag)`. Unlabeled or unknown falls
 /// back to `sh -c`, so a plain ` ``` ` block runs as a shell script.
-fn interpreter(lang: &str) -> (&'static str, &'static str) {
-    match lang.trim().to_ascii_lowercase().as_str() {
-        "" | "sh" | "shell" => ("sh", "-c"),
-        "bash" => ("bash", "-c"),
-        "zsh" => ("zsh", "-c"),
-        "fish" => ("fish", "-c"),
-        "python" | "py" | "python3" => ("python3", "-c"),
-        "ruby" => ("ruby", "-e"),
-        "node" | "js" | "javascript" => ("node", "-e"),
-        _ => ("sh", "-c"),
+/// The program, its "run this string" flag, and its strictness prelude.
+///
+/// One table, deliberately. This was three: `interpreter`, `strict_prelude` and
+/// `is_known_lang` each matched the same input separately, and two of them
+/// disagreed on the fallback arm. `interpreter` fell back to `sh` for an
+/// unrecognized language while `strict_prelude` fell back to `None`, so a block
+/// tagged ```console ran as a shell with no `set -e` and a failing step exited
+/// 0. That is exactly the failure this crate advertises that it prevents,
+/// reachable by one wrong word in a fence.
+///
+/// An unrecognized language falls back to `sh` **with** the shell prelude, and
+/// the parser warns. Forgiving is the right default for a fence tagged
+/// `shell-session` or `bash5`, and the strictness is what makes the fallback
+/// safe: a block that is not a shell script at all (a ```toml table, say) now
+/// fails on its first line instead of running halfway and exiting 0.
+fn interpreter(lang: &str) -> Interpreter {
+    let (program, flag, prelude, recognized) = match lang.trim().to_ascii_lowercase().as_str() {
+        "" | "sh" | "shell" => ("sh", "-c", Some("set -e"), true),
+        "bash" => ("bash", "-c", Some("set -e\nset -o pipefail"), true),
+        "zsh" => ("zsh", "-c", Some("set -e\nset -o pipefail"), true),
+        "fish" => ("fish", "-c", None, true),
+        "python" | "py" | "python3" => ("python3", "-c", None, true),
+        "ruby" => ("ruby", "-e", None, true),
+        "node" | "js" | "javascript" => ("node", "-e", None, true),
+        // Unknown: assume a shell, and give it the same failure detection a
+        // shell gets. The fallback itself was never the bug; the bug was that
+        // this arm resolved to `sh` while the prelude's matching arm resolved
+        // to `None`, so the fallback shell ran unstrict.
+        _ => ("sh", "-c", Some("set -e"), false),
+    };
+    Interpreter {
+        program,
+        flag,
+        prelude,
+        recognized,
     }
 }
 
-/// The strictness prelude for a language, if it has one.
-///
-/// Only shells, and only the settings that are about *detecting failure*, which
-/// is the task runner's job:
-///
-/// - `set -e` stops at the first failing command, so a gate cannot pass while a
-///   step inside it fails.
-/// - `pipefail` extends that through a pipeline, where the exit status would
-///   otherwise be the last stage's and a failing producer would go unnoticed.
-///
-/// Deliberately NOT `set -u`. Catching an unset variable is a lint rather than
-/// failure detection, and it changes the meaning of correct scripts: reading an
-/// optional variable is ordinary in a task file, and defaulting it to a hard
-/// error would break working tasks to catch a typo. Authors who want it can
-/// still write it themselves.
-///
-/// `pipefail` is not POSIX, so plain `sh` gets only `set -e`: dash rejects
-/// `set -o pipefail` outright, which would break every task on a Debian-ish
-/// `/bin/sh`. `fish` gets nothing, having neither the syntax nor the semantics,
-/// and non-shells are left alone entirely.
-fn strict_prelude(lang: &str) -> Option<&'static str> {
-    match lang.trim().to_ascii_lowercase().as_str() {
-        "" | "sh" | "shell" => Some("set -e"),
-        "bash" | "zsh" => Some("set -e\nset -o pipefail"),
-        _ => None,
-    }
+/// How to run one language: the program, its flag, and its strictness prelude.
+struct Interpreter {
+    program: &'static str,
+    flag: &'static str,
+    /// The strictness prelude, or `None` for a language with no failure-detection
+    /// setting worth injecting.
+    ///
+    /// Only shells, and only the settings that are about *detecting failure*,
+    /// which is the task runner's job:
+    ///
+    /// - `set -e` stops at the first failing command, so a gate cannot pass
+    ///   while a step inside it fails.
+    /// - `pipefail` extends that through a pipeline, where the exit status
+    ///   would otherwise be the last stage's and a failing producer would go
+    ///   unnoticed.
+    ///
+    /// Deliberately NOT `set -u`. Catching an unset variable is a lint rather
+    /// than failure detection, and it changes the meaning of correct scripts:
+    /// reading an optional variable is ordinary in a task file, and defaulting
+    /// it to a hard error would break working tasks to catch a typo. Authors
+    /// who want it can still write it themselves.
+    ///
+    /// `pipefail` is not POSIX, so plain `sh` gets only `set -e`: dash rejects
+    /// `set -o pipefail` outright, which would break every task on a
+    /// Debian-ish `/bin/sh`. `fish` gets nothing, having neither the syntax nor
+    /// the semantics, and non-shells are left alone entirely.
+    prelude: Option<&'static str>,
+    /// Whether the language was named in the table, as opposed to falling
+    /// through to the `sh` assumption. Carried here so that "do we know this
+    /// language" is answered by the same table that answers "how do we run it",
+    /// rather than by a second list that can drift from it. It drifting is
+    /// exactly how the unstrict-fallback bug happened.
+    recognized: bool,
 }
 
 /// Replace `{{ name }}` tokens (any inner whitespace) with `args[name]`. A token
@@ -831,7 +867,8 @@ fn finalize(job: Option<Job>, file: &mut TaskFile) {
     }
     if !is_known_lang(&t.lang) {
         file.warnings.push(format!(
-            "task {:?}: fenced language {:?} is not a known interpreter; running as sh",
+            "task {:?}: fenced language {:?} is not a known interpreter; \
+             running as a strict sh script",
             t.name, t.lang
         ));
     }
@@ -839,22 +876,10 @@ fn finalize(job: Option<Job>, file: &mut TaskFile) {
 }
 
 /// Whether a fence language maps to an interpreter (unlabeled counts as `sh`).
+/// Whether `lang` names an interpreter outright, as opposed to falling through
+/// to the `sh` assumption. Derived from the same table, so the two cannot drift.
 fn is_known_lang(lang: &str) -> bool {
-    matches!(
-        lang.trim().to_ascii_lowercase().as_str(),
-        "" | "sh"
-            | "shell"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "python"
-            | "py"
-            | "python3"
-            | "ruby"
-            | "node"
-            | "js"
-            | "javascript"
-    )
+    interpreter(lang).recognized
 }
 
 /// The opening fence marker if `line` starts one, else `None`.
@@ -1374,12 +1399,59 @@ mod tests {
         assert_eq!(tf.jobs[0].env, vec![("KEY".into(), "val".into())]);
     }
 
+    /// An unrecognized language is still a task, run as `sh`, and warned about.
+    /// Forgiving is deliberate: `shell-session` and `bash5` should work.
     #[test]
-    fn duplicate_and_unknown_lang_warn() {
-        let tf = parse("## a\n\n```json\n{}\n```\n\n## a\n\n```sh\ntrue\n```\n");
+    fn an_unknown_language_is_still_a_task_and_warns() {
+        let tf = parse("## a\n\n```shell-session\ntrue\n```\n");
+        assert_eq!(tf.jobs.len(), 1);
+        assert!(tf.warnings.iter().any(|w| w.contains("shell-session")));
+        assert!(tf.warnings.iter().any(|w| w.contains("running as a strict sh")));
+    }
+
+    /// The bug this whole change exists for. The fallback to `sh` was never the
+    /// problem; the fallback running *without* `set -e` was, because a failing
+    /// step then exited 0 and a gate passed while it was broken.
+    #[test]
+    fn the_sh_fallback_is_strict() {
+        for lang in ["console", "shell-session", "terminal", "cmd", "bash5", "toml", "json"] {
+            let i = interpreter(lang);
+            assert_eq!(i.program, "sh", "{lang:?} should fall back to sh");
+            assert!(!i.recognized, "{lang:?} is not a named language");
+            assert!(
+                i.prelude.is_some_and(|p| p.contains("set -e")),
+                "{lang:?} falls back to sh without failure detection"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_names_warn_and_the_first_wins() {
+        let tf = parse("## a\n\n```sh\necho one\n```\n\n## a\n\n```sh\necho two\n```\n");
         assert_eq!(tf.jobs.len(), 2);
+        assert!(tf.jobs[0].script.contains("one"));
         assert!(tf.warnings.iter().any(|w| w.contains("duplicate")));
-        assert!(tf.warnings.iter().any(|w| w.contains("json")));
+    }
+
+    /// The regression this whole change exists for: every language that resolves
+    /// to a shell must carry a failure-detecting prelude, and one that resolves
+    /// to nothing must not resolve to `sh` behind our backs. These were three
+    /// separate `match`es and two of them disagreed.
+    #[test]
+    fn every_language_that_runs_a_shell_detects_failure() {
+        // Anything whose program is a POSIX-ish shell must carry a prelude,
+        // named or fallen-back-to alike. This is the invariant that three
+        // separate `match`es failed to hold between them.
+        for lang in ["", "sh", "shell", "bash", "zsh", "console", "nonsense-tag"] {
+            let i = interpreter(lang);
+            if matches!(i.program, "sh" | "bash" | "zsh") {
+                assert!(
+                    i.prelude.is_some_and(|p| p.contains("set -e")),
+                    "{lang:?} runs {} with no failure detection",
+                    i.program
+                );
+            }
+        }
     }
 
     #[test]
@@ -1600,10 +1672,10 @@ mod tests {
     /// not receive it or every task breaks on a Debian-ish /bin/sh.
     #[test]
     fn plain_sh_does_not_get_pipefail() {
-        assert_eq!(strict_prelude("sh"), Some("set -e"));
-        assert_eq!(strict_prelude(""), Some("set -e"));
-        assert!(strict_prelude("bash").unwrap().contains("pipefail"));
-        assert!(strict_prelude("zsh").unwrap().contains("pipefail"));
+        assert_eq!(interpreter("sh").prelude, Some("set -e"));
+        assert_eq!(interpreter("").prelude, Some("set -e"));
+        assert!(interpreter("bash").prelude.unwrap().contains("pipefail"));
+        assert!(interpreter("zsh").prelude.unwrap().contains("pipefail"));
     }
 
     /// Injecting shell syntax into another language would be a syntax error, so
@@ -1612,7 +1684,7 @@ mod tests {
     fn non_shells_get_no_prelude() {
         for lang in ["python", "ruby", "node", "fish"] {
             assert_eq!(
-                strict_prelude(lang),
+                interpreter(lang).prelude,
                 None,
                 "{lang} must not be given shell syntax"
             );
