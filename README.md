@@ -68,7 +68,13 @@ overlap as a convenience, not a contract.
   `fish`, `python`, `ruby`, `node`, with an unlabeled fence running as `sh`).
 - **A heading with no script is a section**, not a task, so a `# Tasks` container
   is fine.
-- **Metadata** is `Key: value` lines in the task body (case-insensitive):
+- **Metadata** is `Key: value` lines in the task body (case-insensitive). A
+  metadata line must **begin a block**: it follows the heading, a blank line, a
+  fence, a list item, or another metadata line. Inside a paragraph it is prose,
+  and warns. Wrapping a sentence so a line of it happened to read as a key would
+  otherwise let a paragraph configure its own task, including opening the
+  `Agent:` gate, while reading as ordinary prose to every human. Description
+  before metadata, the way task files are already written, is unaffected.
   - `Args:` declares positional arguments in just's syntax. A bare `name` is
     **required**, `name='default'` is **optional** (that value when omitted), and
     a trailing `*name` is **variadic** (it collects the rest, space-joined). They

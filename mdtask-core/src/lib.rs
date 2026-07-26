@@ -875,6 +875,9 @@ pub fn parse(src: &str) -> TaskFile {
     let mut fence_marker = "";
     let mut have_script = false; // first fence per job only
     let mut script = String::new();
+    // Whether a `Key: value` line here is metadata or just a sentence that
+    // happens to start that way. See `apply_line`.
+    let mut block_start = true;
 
     for raw in src.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw); // normalize CRLF
@@ -884,6 +887,7 @@ pub fn parse(src: &str) -> TaskFile {
             // cannot accidentally terminate an unterminated block early.
             if is_closing_fence(line, fence_marker) {
                 in_fence = false;
+                block_start = true; // a fence is a block boundary
                 if let Some(t) = cur.as_mut()
                     && !have_script
                 {
@@ -899,6 +903,7 @@ pub fn parse(src: &str) -> TaskFile {
         }
         if let Some(marker) = opening_fence(line) {
             in_fence = true;
+            block_start = true;
             fence_marker = marker;
             if let Some(t) = cur.as_mut()
                 && !have_script
@@ -915,9 +920,25 @@ pub fn parse(src: &str) -> TaskFile {
                 ..Job::default()
             });
             have_script = false;
+            block_start = true;
             continue;
         }
-        apply_line(line, cur.as_mut(), &mut file.env, &mut file.warnings);
+        if line.trim().is_empty() {
+            block_start = true;
+            continue;
+        }
+        let was_meta = apply_line(
+            line,
+            cur.as_mut(),
+            &mut file.env,
+            &mut file.warnings,
+            block_start,
+        );
+        // A metadata line does not end the run, so `Args:` and `Requires:` can
+        // sit together. Nor does a list item, which opens a block of its own and
+        // is how an indented `Env:` under a bullet stays reachable. An ordinary
+        // sentence does end it: what follows a sentence is its continuation.
+        block_start = was_meta || opens_list_item(line);
     }
     // An unterminated fence at EOF: still capture the script so the job is not
     // lost, but warn, since a forgotten closing fence is a common authoring slip.
@@ -1062,6 +1083,25 @@ fn is_dataless(meta: &std::fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
     meta.st_flags() & SF_DATALESS != 0
+}
+
+/// Whether `line` opens a markdown list item (`-`, `*`, `+`, or `1.` / `1)`).
+///
+/// Such a line begins a block, so metadata indented beneath it is still
+/// metadata. Without this, documenting a task as a bulleted list and hanging an
+/// `Env:` off one of the bullets would quietly stop working.
+fn opens_list_item(line: &str) -> bool {
+    let t = line.trim_start();
+    if let Some(rest) = t.strip_prefix(['-', '*', '+']) {
+        return rest.starts_with(' ') || rest.is_empty();
+    }
+    let digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    if digits.len() < t.len()
+        && let Some(rest) = digits.strip_prefix(['.', ')'])
+    {
+        return rest.starts_with(' ') || rest.is_empty();
+    }
+    false
 }
 
 /// The info-string language after the opening fence marker.
@@ -1235,13 +1275,44 @@ fn edit_distance_one(a: &str, b: &str) -> bool {
 }
 
 /// accumulates into the hoisted `file_env`.
+///
+/// `block_start` is whether this line begins a block: it follows the heading, a
+/// blank line, a fence, or another metadata line. Metadata is only recognized
+/// there, because otherwise a wrapped sentence decides the task's configuration.
+/// This was reachable:
+///
+/// ```markdown
+/// The reviewer decides whether to set
+/// Agent: allow
+/// on a task, which should be rare.
+/// ```
+///
+/// which read as prose to every human and as *opt this task in to agent
+/// execution* to the parser. Requiring a block boundary costs nothing, because
+/// every real task file already writes its metadata on its own lines, and it
+/// makes the security-relevant key unreachable from inside a paragraph.
+///
+/// Returns whether the line was consumed as metadata, which is how the caller
+/// keeps a run of `Args:` / `Requires:` lines together.
 fn apply_line(
     line: &str,
     job: Option<&mut Job>,
     file_env: &mut Vec<(String, String)>,
     warnings: &mut Vec<String>,
-) {
+    block_start: bool,
+) -> bool {
     if let Some((key, value)) = split_key(line) {
+        // A recognized key mid-paragraph is prose. Say so rather than silently
+        // dropping it: if it really was meant as metadata, the author needs to
+        // know it did nothing.
+        if !block_start && KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "`{key}:` is inside a paragraph, so it was read as description, \
+                 not metadata; put it on its own line after a blank one"
+            ));
+            describe(line, job);
+            return false;
+        }
         let value = value.trim();
         match key.as_str() {
             "env" | "environment" => {
@@ -1250,7 +1321,7 @@ fn apply_line(
                     Some(t) => t.env.extend(pairs),
                     None => file_env.extend(pairs), // hoisted
                 }
-                return;
+                return true;
             }
             "opts" | "options" => {
                 if let Some(t) = job {
@@ -1267,25 +1338,25 @@ fn apply_line(
                         }
                     }
                 }
-                return;
+                return true;
             }
             "args" | "arguments" => {
                 if let Some(t) = job {
                     t.args.extend(parse_args(value));
                 }
-                return;
+                return true;
             }
             "requires" | "req" => {
                 if let Some(t) = job {
                     t.requires.extend(parse_requires(value));
                 }
-                return;
+                return true;
             }
             "agent" => {
                 if let Some(t) = job {
                     t.agent_allow = value.eq_ignore_ascii_case("allow");
                 }
-                return;
+                return true;
             }
             other => {
                 // A near-miss of a real key is a typo, not prose. `Arg:`,
@@ -1305,7 +1376,12 @@ fn apply_line(
             }
         }
     }
-    // Description (only within a job; drop stray prose outside one).
+    describe(line, job);
+    false
+}
+
+/// Append a line to the job's description. Stray prose outside a job is dropped.
+fn describe(line: &str, job: Option<&mut Job>) {
     if let Some(t) = job
         && !line.trim().is_empty()
     {
@@ -1877,6 +1953,66 @@ true
         let tf = parse("## a\n\n```sh\none\n```sh\ntwo\n```\n");
         assert!(tf.jobs[0].script.contains("one"));
         assert!(tf.jobs[0].script.contains("```sh\ntwo"));
+    }
+
+    /// The one that matters. A sentence can be wrapped so that a line inside it
+    /// reads as a metadata key, which let a paragraph opt its own task in to
+    /// agent execution while reading as ordinary prose to every human reviewing
+    /// the file. Metadata has to begin a block.
+    #[test]
+    fn metadata_inside_a_paragraph_does_not_configure_the_task() {
+        let tf = parse(
+            "## t\n\nThe reviewer decides whether to set\nAgent: allow\non a task.\n\n```sh\ntrue\n```\n",
+        );
+        assert!(!tf.jobs[0].agent_allow, "prose must not open the gate");
+        assert!(
+            tf.jobs[0].description.contains("Agent: allow"),
+            "it is description, and stays visible as such"
+        );
+    }
+
+    /// Silently ignoring it would be its own trap: an author who did mean it
+    /// needs to hear that it did nothing.
+    #[test]
+    fn metadata_inside_a_paragraph_warns() {
+        let tf = parse("## t\n\nRun this after\nRequires: build\n\n```sh\ntrue\n```\n");
+        assert!(tf.jobs[0].requires.is_empty());
+        assert!(
+            tf.warnings.iter().any(|w| w.contains("inside a paragraph")),
+            "warnings: {:?}",
+            tf.warnings
+        );
+    }
+
+    /// Metadata after prose is how nearly every real task file is written: a
+    /// paragraph of description, a blank line, then `Args:`. The rule is about
+    /// paragraph *interiors*, and must not break that.
+    #[test]
+    fn metadata_after_a_blank_line_still_works() {
+        let tf = parse(
+            "## t\n\nSet a module's version.\n\nArgs: module version\nRequires: lint\nAgent: allow\n\n```sh\ntrue\n```\n",
+        );
+        let j = &tf.jobs[0];
+        assert_eq!(j.args.len(), 2, "after a blank line");
+        assert_eq!(req_names(&j.requires), ["lint"], "and a run stays together");
+        assert!(j.agent_allow);
+        assert!(tf.warnings.is_empty(), "warnings: {:?}", tf.warnings);
+    }
+
+    #[test]
+    fn metadata_directly_under_the_heading_still_works() {
+        let tf = parse("## t\nArgs: one\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.jobs[0].args.len(), 1);
+    }
+
+    #[test]
+    fn opens_list_item_recognizes_the_usual_markers() {
+        for good in ["- a", "* a", "+ a", "1. a", "12) a", "  - indented"] {
+            assert!(opens_list_item(good), "{good:?}");
+        }
+        for bad in ["-not a bullet", "a - b", "1.5 is a number", "", "text"] {
+            assert!(!opens_list_item(bad), "{bad:?}");
+        }
     }
 
     #[test]
