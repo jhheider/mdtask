@@ -998,10 +998,10 @@ fn is_closing_fence(line: &str, marker: &str) -> bool {
 /// Embedders with their own project root can ignore this and call [`parse`].
 pub fn find_task_files(start: &Path) -> Vec<(PathBuf, TaskFile)> {
     let mut found = Vec::new();
-    for dir in start.ancestors() {
+    for (depth, dir) in start.ancestors().enumerate() {
         for name in ["tasks.md", "maskfile.md", "README.md"] {
             let path = dir.join(name);
-            if let Ok(src) = std::fs::read_to_string(&path) {
+            if let Some(src) = read_candidate(&path, depth == 0) {
                 let tf = parse(&src);
                 if !tf.jobs.is_empty() {
                     found.push((path, tf));
@@ -1011,6 +1011,57 @@ pub fn find_task_files(start: &Path) -> Vec<(PathBuf, TaskFile)> {
         }
     }
     found
+}
+
+/// The largest candidate we will read. A task file is hand-written markdown;
+/// four mebibytes is orders of magnitude past any real one, and the cap is what
+/// stops a `README.md` that happens to be a multi-gigabyte generated dump from
+/// being pulled into memory by a walk nobody asked for.
+const MAX_TASK_FILE: u64 = 4 * 1024 * 1024;
+
+/// Read a candidate task file, or `None` if it is absent or something we should
+/// not block on.
+///
+/// The walk touches every ancestor directory up to the root, so it reads files
+/// the user never mentioned. That makes an unbounded read the wrong default:
+///
+/// - **Not a regular file.** `read_to_string` on a FIFO blocks until someone
+///   writes to it, which may be never. A `tasks.md` FIFO in any ancestor
+///   directory would hang every `mdtask` invocation run beneath it, and hang an
+///   embedder like gloaming on startup with no way out. Character devices are
+///   the same problem with a worse ending.
+/// - **Too large.** See [`MAX_TASK_FILE`].
+/// - **A cloud placeholder** (macOS). iCloud and Dropbox leave dataless stubs;
+///   reading one triggers an on-demand download and blocks until it lands, or
+///   forever if the provider is offline. `explicit` is the directory the caller
+///   actually named: there, a download is what was asked for. In an ancestor it
+///   is a passive read, and passive reads must not stall or mass-download.
+///
+/// Stat-then-read is a race in principle. It is not a security boundary: anyone
+/// who can swap this path can also write the shell script it contains.
+fn read_candidate(path: &Path, explicit: bool) -> Option<String> {
+    // Follows symlinks deliberately, so a symlink pointing at a FIFO is judged
+    // by what it resolves to rather than by being a link.
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_TASK_FILE {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    if !explicit && is_dataless(&meta) {
+        return None;
+    }
+    let _ = explicit;
+    std::fs::read_to_string(path).ok()
+}
+
+/// Whether a macOS File Provider left this file dataless: present in the
+/// directory listing, with no local blocks behind it. `metadata` reports the
+/// flag without materializing the file, which is the whole point of checking.
+#[cfg(target_os = "macos")]
+fn is_dataless(meta: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    meta.st_flags() & SF_DATALESS != 0
 }
 
 /// The info-string language after the opening fence marker.
@@ -1997,6 +2048,94 @@ true
         // The parent still supplies `base` as an inherited baseline.
         assert!(files[1].1.job("base").is_some());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A FIFO named `tasks.md` in an ancestor directory used to hang every
+    /// invocation run beneath it, forever, with no output and no way out: the
+    /// walk read it unconditionally and `read_to_string` on a FIFO blocks until
+    /// someone writes. An embedder loading tasks at startup just never started.
+    ///
+    /// The timeout is the assertion. A regression here does not fail the test,
+    /// it hangs the whole test binary, so the wait has to be bounded and the
+    /// work has to happen somewhere it can be abandoned.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_task_file_does_not_hang_the_walk() {
+        let base = std::env::temp_dir().join(format!("mdtask-fifo-{}", std::process::id()));
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let fifo = base.join("tasks.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            std::fs::remove_dir_all(&base).ok();
+            return; // no mkfifo here; nothing to prove
+        }
+        // A real file below it, so we can also see the walk carried on.
+        std::fs::write(child.join("tasks.md"), "## only\n\n```sh\ntrue\n```\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = child.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(find_task_files(&probe).len());
+        });
+        let found = rx.recv_timeout(std::time::Duration::from_secs(10));
+        std::fs::remove_dir_all(&base).ok();
+
+        let found = found.expect("the walk returned instead of blocking on the FIFO");
+        assert_eq!(
+            found, 1,
+            "the FIFO was skipped and the real file still read"
+        );
+    }
+
+    /// A `README.md` is a candidate, and a README can be a generated dump. The
+    /// walk should not pull an arbitrarily large one into memory to discover it
+    /// has no task headings in it.
+    #[test]
+    fn an_oversized_candidate_is_skipped() {
+        let base = std::env::temp_dir().join(format!("mdtask-big-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("tasks.md");
+
+        let real = "## only\n\n```sh\ntrue\n```\n";
+        std::fs::write(&path, real).unwrap();
+        assert!(
+            read_candidate(&path, true).is_some(),
+            "an ordinary file reads"
+        );
+
+        let padding = "x".repeat(MAX_TASK_FILE as usize + 1);
+        std::fs::write(&path, padding).unwrap();
+        assert!(
+            read_candidate(&path, true).is_none(),
+            "an oversized one does not"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A directory named `tasks.md` is not a task file, and must not stop the
+    /// walk from finding the real one further up.
+    #[test]
+    fn a_directory_named_like_a_task_file_is_skipped() {
+        let base = std::env::temp_dir().join(format!("mdtask-dir-{}", std::process::id()));
+        let child = base.join("child");
+        std::fs::create_dir_all(child.join("tasks.md")).unwrap();
+        std::fs::write(base.join("tasks.md"), "## only\n\n```sh\ntrue\n```\n").unwrap();
+
+        let files = find_task_files(&child);
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].1.job("only").is_some(),
+            "the real one, one level up"
+        );
     }
 
     #[test]
