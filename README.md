@@ -88,14 +88,37 @@ overlap as a convenience, not a contract.
     - **`no-strict`**: turn off the shell strictness described below.
   - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
-  - `Requires:` lists task dependencies. The CLI runs them first, resolved across
-    the layered files, dependencies before dependents, each once (a diamond runs
-    its shared dependency once), aborting on the first failure. A missing or
-    cyclic dependency is a hard error. Dependencies run with no positional args
-    (their defaults fill in); only the named target receives the CLI args. Note
-    that dependencies **re-run on every invocation**: there is no `make`-style
-    "already satisfied" mtime or hash check, so `Requires:` is for ordering, not
-    for skipping work that is already done.
+  - `Requires:` lists task dependencies, comma-separated. The CLI runs them
+    first, resolved across the layered files, dependencies before dependents,
+    each once (a diamond runs its shared dependency once), aborting on the first
+    failure. A missing or cyclic dependency is a hard error.
+
+    A dependency may take **arguments**, in parentheses, which is just's syntax:
+
+    ```markdown
+    Requires: lint, (dist {{ module }}), (deploy "the droplet" now)
+    ```
+
+    A bare name runs on its own defaults, as before. Inside the parentheses the
+    first word is the task and the rest are its positional arguments, separated
+    by whitespace or commas; quote one to include either. `{{ name }}` resolves
+    against **the invocation's** arguments — the values bound to the task named
+    on the command line — so `mdtask release bonus-die` means `bonus-die`
+    throughout the chain, however deep. One scope for the whole chain, rather
+    than each job resolving against its own caller.
+
+    Unlike `{{ }}` in a script body, this is not a shell injection risk: the
+    value becomes one element of an argument list, never text spliced into
+    source. A placeholder naming nothing is left as written.
+
+    Deduplication keys on the task **and its resolved arguments**, so
+    `(dist api)` and `(dist web)` both run, while two paths reaching
+    `(dist api)` still run it once. Cycle detection keys on the name alone, so
+    a task requiring itself is an error however the arguments differ.
+
+    Note that dependencies **re-run on every invocation**: there is no
+    `make`-style "already satisfied" mtime or hash check, so `Requires:` is for
+    ordering, not for skipping work that is already done.
   - `Agent: allow` opts a task in to an MCP or agent surface. It is **off by
     default**. `run` and `run_captured` ignore it; the gate is `run_agent` (which
     refuses anything not allowed) and `agent_jobs` (which lists only the allowed

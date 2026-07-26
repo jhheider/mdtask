@@ -77,7 +77,7 @@ pub struct Job {
     /// `Requires:` names the jobs this one depends on. The `run*` entry points
     /// resolve the transitive order (deps first, cycle and typo detected) and run
     /// each in turn, stopping on the first non-success step.
-    pub requires: Vec<String>,
+    pub requires: Vec<Requirement>,
     /// `Agent: allow` opts a job in to being listed and run by an MCP or agent
     /// surface. The flag alone enforces nothing: [`run_agent`] is the gate that
     /// checks it (and [`agent_jobs`] the listing that filters on it), so a plain
@@ -95,6 +95,34 @@ pub struct Job {
     pub(crate) opts: Vec<String>,
     /// `Env:` adds extra environment for this job.
     pub(crate) env: Vec<(String, String)>,
+}
+
+/// One entry in a `Requires:` list: a job to run first, and the arguments to run
+/// it with.
+///
+/// Comma-separated, and an entry in parentheses carries arguments, borrowing
+/// just's `(dist module)` shape:
+///
+/// ```text
+/// Requires: lint, (dist bonus-die)
+/// Requires: (dist {{ module }})
+/// ```
+///
+/// A bare name takes no arguments, which is what every `Requires:` meant before
+/// this existed, so old files keep working.
+///
+/// `{{ name }}` inside an argument resolves against the arguments of the job
+/// that *declares* the requirement. Unlike `{{ }}` in a script this is not an
+/// injection risk: the value becomes an argument to the dependency, which binds
+/// it as an environment variable, and is never spliced into a script's source.
+/// A dependency that then templates it into its own script is refused by
+/// [`run_agent`] exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    /// The job to run first.
+    pub name: String,
+    /// Positional arguments for it, as written, before `{{ }}` resolution.
+    pub args: Vec<String>,
 }
 
 /// One declared positional argument.
@@ -219,19 +247,27 @@ impl std::error::Error for RunError {
 /// pathologically deep chain cannot overflow the call stack and abort the process.
 pub(crate) fn dependency_order(
     target: &str,
-    requires_of: impl Fn(&str) -> Option<Vec<String>>,
-) -> Result<Vec<String>, DepError> {
+    requires_of: impl Fn(&str) -> Option<Vec<Requirement>>,
+) -> Result<Vec<Step>, DepError> {
     // Each frame is a job whose dependencies we are still walking (`next` is the
     // index of the next dependency to descend into). A post-order DFS: a frame
     // moves to `order` only once all its dependencies are done.
     struct Frame {
         name: String,
-        deps: Vec<String>,
+        args: Vec<String>,
+        deps: Vec<Requirement>,
         next: usize,
     }
 
-    let mut order = Vec::new();
-    let mut done = BTreeSet::new();
+    let mut order: Vec<Step> = Vec::new();
+    // Keyed on name *and* arguments: a diamond whose two paths ask for the same
+    // thing still runs it once, but two callers asking for `(dist a)` and
+    // `(dist b)` genuinely want two runs, and collapsing them would silently
+    // drop one caller's request.
+    let mut done: BTreeSet<(String, Vec<String>)> = BTreeSet::new();
+    // Cycle detection is on the name alone: `a` needing `(b x)` needing `(a y)`
+    // is a cycle however the arguments differ, and keying this on arguments too
+    // would let it spin forever generating new pairs.
     let mut on_stack = BTreeSet::new();
     let mut stack: Vec<Frame> = Vec::new();
 
@@ -242,6 +278,7 @@ pub(crate) fn dependency_order(
     on_stack.insert(target.to_string());
     stack.push(Frame {
         name: target.to_string(),
+        args: Vec::new(),
         deps,
         next: 0,
     });
@@ -261,20 +298,22 @@ pub(crate) fn dependency_order(
         };
         match descend {
             Some(dep) => {
-                if done.contains(&dep) {
+                let key = (dep.name.clone(), dep.args.clone());
+                if done.contains(&key) {
                     continue; // already resolved via another path (a diamond)
                 }
-                if on_stack.contains(&dep) {
-                    return Err(DepError::Cycle(dep));
+                if on_stack.contains(&dep.name) {
+                    return Err(DepError::Cycle(dep.name));
                 }
                 let required_by = stack.last().expect("a top frame exists").name.clone();
-                let deps = requires_of(&dep).ok_or(DepError::Missing {
-                    task: dep.clone(),
+                let deps = requires_of(&dep.name).ok_or(DepError::Missing {
+                    task: dep.name.clone(),
                     required_by,
                 })?;
-                on_stack.insert(dep.clone());
+                on_stack.insert(dep.name.clone());
                 stack.push(Frame {
-                    name: dep,
+                    name: dep.name,
+                    args: dep.args,
                     deps,
                     next: 0,
                 });
@@ -282,12 +321,24 @@ pub(crate) fn dependency_order(
             None => {
                 let frame = stack.pop().expect("a top frame exists");
                 on_stack.remove(&frame.name);
-                done.insert(frame.name.clone());
-                order.push(frame.name);
+                done.insert((frame.name.clone(), frame.args.clone()));
+                order.push(Step {
+                    name: frame.name,
+                    args: frame.args,
+                });
             }
         }
     }
     Ok(order)
+}
+
+/// One resolved step of a dependency chain: a job, and the arguments it runs
+/// with. The target's own arguments come from the caller, so its `args` here is
+/// empty and filled in by the planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub(crate) name: String,
+    pub(crate) args: Vec<String>,
 }
 
 /// The `Opts:` flags mdtask recognizes. An `Opts:` value outside this set is
@@ -488,7 +539,7 @@ fn trusted_lookup<'a>(
 
 /// Resolve `target` and its `Requires:` chain across the layered files (deps
 /// first, target last, each once). A name that resolves nowhere is `NotFound`.
-fn trusted_order(files: &[(PathBuf, TaskFile)], target: &str) -> Result<Vec<String>, RunError> {
+fn trusted_order(files: &[(PathBuf, TaskFile)], target: &str) -> Result<Vec<Step>, RunError> {
     if trusted_lookup(files, target).is_none() {
         return Err(RunError::NotFound(target.to_string()));
     }
@@ -499,20 +550,57 @@ fn trusted_order(files: &[(PathBuf, TaskFile)], target: &str) -> Result<Vec<Stri
 }
 
 /// Build the ordered, ready-to-spawn invocations for `order`. `lookup` resolves
-/// each step to its file, job, and directory; only `target` receives `args`,
-/// while every dependency runs argless (its own defaults fill in).
+/// each step to its file, job, and directory.
+///
+/// The target receives the caller's `args`. A dependency receives whatever its
+/// `Requires:` entry declared, with `{{ name }}` resolved against **the
+/// invocation's** arguments: the values bound to the task actually named on the
+/// command line.
+///
+/// One scope for the whole chain, rather than each job resolving against its own
+/// caller. That is a real choice and worth stating: the walk is post-order, so a
+/// dependency is planned before the parent that declares it, and a per-caller
+/// scope would mean binding parents before children purely to read their values
+/// back. One scope is also easier to explain, and it matches what a chain is for
+/// (`release bonus-die` should mean bonus-die throughout).
+///
+/// A dependency that declared no arguments still runs on its own defaults.
 fn plan_invocations<'a>(
-    order: &[String],
+    order: &[Step],
     target: &str,
     args: &[String],
     cwd: &Path,
     lookup: impl Fn(&str) -> Option<(&'a TaskFile, &'a Job, Option<&'a Path>)>,
 ) -> Result<Vec<Invocation>, RunError> {
-    let mut plan = Vec::with_capacity(order.len());
+    // The invocation's own bindings, resolved up front so every step in the
+    // chain can be written against them.
+    let scope = {
+        let (_, job, _) = lookup(target).expect("the target resolves");
+        TaskFile::bind(job, args).map_err(RunError::MissingArg)?
+    };
+
+    // Resolve first, then dedupe. The walk could only dedupe on the templates as
+    // written, so `(dist {{ module }})` and `(dist foundry)` looked like two
+    // different steps right up until they resolved to the same one. Deduping
+    // here keeps the first occurrence, which is still ahead of everything that
+    // depends on it.
+    let mut seen = BTreeSet::new();
+    let mut resolved: Vec<(&str, Vec<String>)> = Vec::with_capacity(order.len());
     for step in order {
-        let (tf, job, dir) = lookup(step).expect("a resolved name still resolves");
-        let step_args: &[String] = if step == target { args } else { &[] };
-        let values = TaskFile::bind(job, step_args).map_err(RunError::MissingArg)?;
+        let step_args: Vec<String> = if step.name == target {
+            args.to_vec()
+        } else {
+            step.args.iter().map(|a| substitute(a, &scope)).collect()
+        };
+        if seen.insert((step.name.clone(), step_args.clone())) {
+            resolved.push((step.name.as_str(), step_args));
+        }
+    }
+
+    let mut plan = Vec::with_capacity(resolved.len());
+    for (name, step_args) in resolved {
+        let (tf, job, dir) = lookup(name).expect("a resolved name still resolves");
+        let values = TaskFile::bind(job, &step_args).map_err(RunError::MissingArg)?;
         let inv = tf
             .invocation(job, &values, cwd, dir)
             .map_err(RunError::MissingArg)?;
@@ -952,6 +1040,110 @@ fn heading(line: &str) -> Option<String> {
 
 /// Apply a body line: a recognized `Key: value` sets metadata (case-insensitive
 /// key, xc vocabulary); anything else is description. `Env:` before the first job
+/// Parse a `Requires:` value into requirements.
+///
+/// Comma-separated. A bare entry is a name with no arguments; an entry wrapped
+/// in parentheses is a name followed by whitespace-separated arguments, which is
+/// just's `(dist module)` shape. Splitting on commas first is what makes the
+/// parenthesised form unambiguous: whitespace can mean "next argument" precisely
+/// because it never had to mean "next dependency".
+/// Split a `Requires:` value into its entries, on commas that are not inside a
+/// parenthesised entry. `(deploy a, b)` is one entry with two arguments, not two
+/// entries, which is why this is not `value.split(',')`.
+fn split_entries(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
+/// Split the inside of a parenthesised entry into a name and its arguments.
+///
+/// Whitespace or a comma separates. A comma already means "next thing" at the
+/// entry level, so `(deploy a, b)` reading as two arguments is what anyone will
+/// expect; a literal comma needs quoting.
+///
+/// Two things are held together across a separator: a `{{ ... }}` placeholder
+/// (one token however it is spaced, so `{{ module }}` stays a placeholder rather
+/// than becoming three arguments), and a double-quoted run (so an argument may
+/// contain a space or a comma at all).
+fn split_args(inner: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut rest = inner;
+
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() || c == ',' {
+            if has {
+                out.push(std::mem::take(&mut cur));
+                has = false;
+            }
+            rest = &rest[c.len_utf8()..];
+        } else if rest.starts_with("{{") {
+            // Verbatim through the closing braces, so `substitute` sees an
+            // intact placeholder later. Unterminated, it is just literal text.
+            let end = rest.find("}}").map_or(rest.len(), |i| i + 2);
+            cur.push_str(&rest[..end]);
+            has = true;
+            rest = &rest[end..];
+        } else if c == '"' {
+            let body = &rest[1..];
+            let end = body.find('"');
+            cur.push_str(end.map_or(body, |i| &body[..i]));
+            has = true;
+            rest = end.map_or("", |i| &body[i + 1..]);
+        } else {
+            cur.push(c);
+            has = true;
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
+fn parse_requires(value: &str) -> Vec<Requirement> {
+    split_entries(value)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            match entry
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                Some(inner) => {
+                    let mut parts = split_args(inner).into_iter();
+                    Requirement {
+                        name: parts.next().unwrap_or_default(),
+                        args: parts.collect(),
+                    }
+                }
+                None => Requirement {
+                    name: entry.to_string(),
+                    args: Vec::new(),
+                },
+            }
+        })
+        .filter(|r: &Requirement| !r.name.is_empty())
+        .collect()
+}
+
 /// The metadata keys, and the aliases each accepts.
 const KEYS: &[&str] = &[
     "env",
@@ -1034,12 +1226,7 @@ fn apply_line(
             }
             "requires" | "req" => {
                 if let Some(t) = job {
-                    t.requires.extend(
-                        value
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
-                    );
+                    t.requires.extend(parse_requires(value));
                 }
                 return;
             }
@@ -1224,7 +1411,7 @@ mod tests {
             t.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             ["target"]
         );
-        assert_eq!(t.requires, vec!["build", "test"]);
+        assert_eq!(req_names(&t.requires), ["build", "test"]);
         assert!(t.agent_allow);
     }
 
@@ -1350,31 +1537,220 @@ mod tests {
         assert!(tf.warnings.iter().any(|w| w.contains("bogus")));
     }
 
+    fn req_names(reqs: &[Requirement]) -> Vec<&str> {
+        reqs.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// A requirement with no arguments, which is what most of these graphs are.
+    fn bare(name: &str) -> Requirement {
+        Requirement {
+            name: name.to_string(),
+            args: Vec::new(),
+        }
+    }
+
+    /// The names of a planned order. Ordering is what these tests are about, so
+    /// they read better against names than against whole `Step`s.
+    fn step_names(steps: &[Step]) -> Vec<&str> {
+        steps.iter().map(|s| s.name.as_str()).collect()
+    }
+
     // A `requires_of` for tests: a map from job name to its dependency names.
-    fn deps_of<'a>(map: &'a [(&str, &[&str])]) -> impl Fn(&str) -> Option<Vec<String>> + 'a {
+    fn deps_of<'a>(map: &'a [(&str, &[&str])]) -> impl Fn(&str) -> Option<Vec<Requirement>> + 'a {
         move |name| {
             map.iter()
                 .find(|(n, _)| *n == name)
-                .map(|(_, ds)| ds.iter().map(|s| s.to_string()).collect())
+                .map(|(_, ds)| ds.iter().map(|s| bare(s)).collect())
         }
+    }
+
+    // ---- parameterized dependencies ---------------------------------------
+
+    #[test]
+    fn a_bare_requirement_carries_no_arguments() {
+        let reqs = parse_requires("build, test");
+        assert_eq!(req_names(&reqs), ["build", "test"]);
+        assert!(reqs.iter().all(|r| r.args.is_empty()));
+    }
+
+    #[test]
+    fn a_parenthesised_requirement_carries_its_arguments() {
+        let reqs = parse_requires("lint, (dist bonus-die)");
+        assert_eq!(req_names(&reqs), ["lint", "dist"]);
+        assert!(reqs[0].args.is_empty(), "the bare one is untouched");
+        assert_eq!(reqs[1].args, ["bonus-die"]);
+    }
+
+    /// `{{ module }}` is conventionally written with spaces, and a plain
+    /// whitespace split turns it into three arguments. It must survive whole or
+    /// the syntax is unusable in the form everyone will write it in.
+    #[test]
+    fn a_spaced_placeholder_stays_one_argument() {
+        assert_eq!(
+            parse_requires("(dist {{ module }})")[0].args,
+            ["{{ module }}"]
+        );
+        assert_eq!(parse_requires("(dist {{module}})")[0].args, ["{{module}}"]);
+        // And a placeholder is a token, not the whole argument.
+        assert_eq!(
+            parse_requires("(dist {{ module }}-docs)")[0].args,
+            ["{{ module }}-docs"]
+        );
+    }
+
+    /// Entries are comma-separated and arguments are space-separated, so a comma
+    /// inside the parentheses would otherwise cut an entry in half and leave a
+    /// requirement named `b)`.
+    #[test]
+    fn a_comma_inside_parentheses_does_not_split_the_entry() {
+        let reqs = parse_requires("(deploy a, b), lint");
+        assert_eq!(req_names(&reqs), ["deploy", "lint"]);
+        assert_eq!(reqs[0].args, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_quoted_argument_may_contain_a_space() {
+        let reqs = parse_requires(r#"(deploy "the droplet, west" now)"#);
+        assert_eq!(reqs[0].args, ["the droplet, west", "now"]);
+    }
+
+    /// An unterminated placeholder or quote is text, not a parse failure: this
+    /// runs over hand-written markdown, and refusing to plan is worse than
+    /// passing through what was actually typed.
+    #[test]
+    fn an_unterminated_placeholder_or_quote_is_taken_literally() {
+        assert_eq!(parse_requires("(dist {{ module)")[0].args, ["{{ module"]);
+        assert_eq!(parse_requires(r#"(dist "oops)"#)[0].args, ["oops"]);
+    }
+
+    fn plan_for(src: &str, target: &str, args: &[&str]) -> Vec<Invocation> {
+        let files = vec![(PathBuf::from("tasks.md"), parse(src))];
+        let order = trusted_order(&files, target).expect("resolves");
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        plan_invocations(&order, target, &args, Path::new("."), |n| {
+            trusted_lookup(&files, n)
+        })
+        .expect("plans")
+    }
+
+    /// The value of an argument as the step will actually see it.
+    fn env_of<'a>(inv: &'a Invocation, key: &str) -> Option<&'a str> {
+        inv.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    const PARAM: &str = "\
+## dist
+
+Args: module
+
+```sh
+true
+```
+
+## lint
+
+```sh
+true
+```
+
+## release
+
+Args: module
+Requires: lint, (dist {{ module }})
+
+```sh
+true
+```
+";
+
+    /// The point of the whole feature. Before this, a job taking an argument
+    /// could not be a dependency at all: it would be planned with none and fail
+    /// on a missing value, so the chain was unrunnable.
+    #[test]
+    fn a_placeholder_resolves_to_the_invocations_argument() {
+        let plan = plan_for(PARAM, "release", &["foundry"]);
+        assert_eq!(plan.len(), 3, "lint, dist, release");
+        assert_eq!(env_of(&plan[1], "module"), Some("foundry"), "dist got it");
+        assert_eq!(
+            env_of(&plan[2], "module"),
+            Some("foundry"),
+            "and so did release"
+        );
+    }
+
+    /// Deduplication keys on the arguments too. Two `dist` steps with different
+    /// modules are two different pieces of work, and collapsing them to one
+    /// would silently skip a build.
+    #[test]
+    fn the_same_task_with_different_arguments_runs_twice() {
+        let src = PARAM.replace(
+            "Requires: lint, (dist {{ module }})",
+            "Requires: (dist {{ module }}), (dist {{ module }}-docs)",
+        );
+        let plan = plan_for(&src, "release", &["foundry"]);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(env_of(&plan[0], "module"), Some("foundry"));
+        assert_eq!(env_of(&plan[1], "module"), Some("foundry-docs"));
+    }
+
+    #[test]
+    fn the_same_task_with_the_same_arguments_still_runs_once() {
+        let src = PARAM.replace(
+            "Requires: lint, (dist {{ module }})",
+            "Requires: (dist {{ module }}), (dist foundry)",
+        );
+        let plan = plan_for(&src, "release", &["foundry"]);
+        assert_eq!(plan.len(), 2, "the two dist steps are the same work");
+    }
+
+    /// A placeholder naming something the invocation does not have is left as
+    /// written rather than becoming an empty argument, matching how `substitute`
+    /// treats an unknown token in a script body.
+    #[test]
+    fn an_unknown_placeholder_is_left_alone() {
+        let src = PARAM.replace("(dist {{ module }})", "(dist {{ nonesuch }})");
+        let plan = plan_for(&src, "release", &["foundry"]);
+        assert_eq!(env_of(&plan[1], "module"), Some("{{ nonesuch }}"));
+    }
+
+    /// Cycle detection keys on the name alone. Keying it on name-plus-arguments
+    /// would let `a` require `(a {{ x }}-more)` recurse forever, generating a
+    /// longer argument each time and never repeating a key.
+    #[test]
+    fn a_self_reference_with_different_arguments_is_still_a_cycle() {
+        let files = vec![(
+            PathBuf::from("tasks.md"),
+            parse("## a\n\nArgs: x\nRequires: (a {{ x }}-more)\n\n```sh\ntrue\n```\n"),
+        )];
+        assert!(matches!(
+            trusted_order(&files, "a"),
+            Err(RunError::Dependency(DepError::Cycle(_)))
+        ));
     }
 
     #[test]
     fn dependency_order_is_deps_first_target_last() {
         // a -> b -> c, plus a -> c: c runs once, before b, and a is last.
         let g = deps_of(&[("a", &["b", "c"]), ("b", &["c"]), ("c", &[])]);
-        assert_eq!(dependency_order("a", g).unwrap(), ["c", "b", "a"]);
+        assert_eq!(
+            step_names(&dependency_order("a", g).unwrap()),
+            ["c", "b", "a"]
+        );
     }
 
     #[test]
     fn dependency_order_dedupes_a_diamond() {
         let g = deps_of(&[("a", &["b", "c"]), ("b", &["d"]), ("c", &["d"]), ("d", &[])]);
-        let order = dependency_order("a", g).unwrap();
-        assert_eq!(order.iter().filter(|n| *n == "d").count(), 1);
+        let planned = dependency_order("a", g).unwrap();
+        let order = step_names(&planned);
+        assert_eq!(order.iter().filter(|n| **n == "d").count(), 1);
         // d before b and c; a last.
-        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+        let pos = |n: &str| order.iter().position(|x| *x == n).unwrap();
         assert!(pos("d") < pos("b") && pos("d") < pos("c"));
-        assert_eq!(order.last().unwrap(), "a");
+        assert_eq!(*order.last().unwrap(), "a");
     }
 
     #[test]
@@ -1403,15 +1779,16 @@ mod tests {
         let order = dependency_order("t0", |n| {
             let i: usize = n.strip_prefix('t')?.parse().ok()?;
             Some(if i + 1 < N {
-                vec![format!("t{}", i + 1)]
+                vec![bare(&format!("t{}", i + 1))]
             } else {
                 vec![]
             })
         })
         .unwrap();
+        let order = step_names(&order);
         assert_eq!(order.len(), N);
-        assert_eq!(order.first().unwrap(), &format!("t{}", N - 1)); // deepest runs first
-        assert_eq!(order.last().unwrap(), "t0"); // target runs last
+        assert_eq!(*order.first().unwrap(), format!("t{}", N - 1)); // deepest runs first
+        assert_eq!(*order.last().unwrap(), "t0"); // target runs last
     }
 
     #[test]
@@ -1465,7 +1842,7 @@ mod tests {
     #[test]
     fn repeated_metadata_lines_accumulate() {
         let tf = parse("## t\n\nRequires: alpha\nRequires: beta\n\n```sh\ntrue\n```\n");
-        assert_eq!(tf.jobs[0].requires, vec!["alpha", "beta"]);
+        assert_eq!(req_names(&tf.jobs[0].requires), ["alpha", "beta"]);
 
         let tf = parse("## t\n\nArgs: a\nArgs: b\n\n```sh\ntrue\n```\n");
         let names: Vec<_> = tf.jobs[0].args.iter().map(|a| a.name.as_str()).collect();
@@ -1507,7 +1884,11 @@ mod tests {
         let tf = parse("## a\n\n```shell-session\ntrue\n```\n");
         assert_eq!(tf.jobs.len(), 1);
         assert!(tf.warnings.iter().any(|w| w.contains("shell-session")));
-        assert!(tf.warnings.iter().any(|w| w.contains("running as a strict sh")));
+        assert!(
+            tf.warnings
+                .iter()
+                .any(|w| w.contains("running as a strict sh"))
+        );
     }
 
     /// The bug this whole change exists for. The fallback to `sh` was never the
@@ -1515,7 +1896,15 @@ mod tests {
     /// step then exited 0 and a gate passed while it was broken.
     #[test]
     fn the_sh_fallback_is_strict() {
-        for lang in ["console", "shell-session", "terminal", "cmd", "bash5", "toml", "json"] {
+        for lang in [
+            "console",
+            "shell-session",
+            "terminal",
+            "cmd",
+            "bash5",
+            "toml",
+            "json",
+        ] {
             let i = interpreter(lang);
             assert_eq!(i.program, "sh", "{lang:?} should fall back to sh");
             assert!(!i.recognized, "{lang:?} is not a named language");
