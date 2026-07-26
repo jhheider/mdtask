@@ -5,7 +5,7 @@ tasks in the same markdown you already write, whether a `tasks.md`, a
 `maskfile.md`, or a project `README.md`, and run them from a library, a CLI, or
 an agent-safe MCP surface.
 
-```markdown
+````markdown
 # Tasks
 
 Env: PKGX_DISABLE_UPDATE=1        # hoisted to every task
@@ -29,7 +29,7 @@ Opts: inherit-cwd
 ```sh
 pandoc -t pdf -o "${file%md}pdf" "$file"
 ```
-```
+````
 
 ```console
 $ mdtask                 # list tasks (see "Finding task files" below)
@@ -301,9 +301,15 @@ allow gate and the injection guard.
 
 ## Status
 
-Early. The core parser and runner are solid and tested; the CLI runs tasks and
-serves MCP; a crates.io release is still pending. Intended consumers:
-[gloaming](https://github.com/jhheider/gloaming) and penknife.
+Published on crates.io: [`mdtask`](https://crates.io/crates/mdtask) (the CLI) and
+[`mdtask-core`](https://crates.io/crates/mdtask-core) (the library). The parser
+and runner are tested and in use; the CLI runs tasks and serves MCP.
+
+0.5 tightened several defaults after a security and usability audit, and one of
+them is breaking: inheriting tasks from a parent directory is now opt-in. See
+[Finding task files](#finding-task-files).
+
+Consumers: [gloaming](https://github.com/jhheider/gloaming) and penknife.
 
 ## Credits
 
