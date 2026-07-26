@@ -121,6 +121,9 @@ pub struct Arg {
 /// it, and no consumer ever sees the program, argv, or interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Invocation {
+    /// The task this step runs, carried so a spawn failure can say which step
+    /// of a `Requires:` chain it was.
+    pub task: String,
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -180,8 +183,20 @@ pub enum RunError {
     MissingArg(MissingArg),
     /// The `Requires:` chain could not be resolved (a typo or a cycle).
     Dependency(DepError),
-    /// Spawning a step failed (the interpreter is missing, the directory is gone).
-    Io(std::io::Error),
+    /// Spawning a step failed: the interpreter is not installed, or the
+    /// directory the task would run in is gone.
+    ///
+    /// Carries which task and which program, because the bare `io::Error` was
+    /// "No such file or directory (os error 2)" and nothing else. In a
+    /// `Requires:` chain that named neither the failing step nor the thing that
+    /// was missing, and the obvious reading of it, that a file the *script*
+    /// wanted was absent, was the wrong one.
+    Io {
+        task: String,
+        program: String,
+        cwd: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for RunError {
@@ -202,7 +217,24 @@ impl std::fmt::Display for RunError {
             ),
             RunError::MissingArg(e) => e.fmt(f),
             RunError::Dependency(e) => e.fmt(f),
-            RunError::Io(e) => e.fmt(f),
+            RunError::Io {
+                task,
+                program,
+                cwd,
+                source,
+            } => {
+                write!(f, "task {task:?}: could not run {program:?}")?;
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    // Distinguish the two NotFound cases, which read identically
+                    // and have completely different fixes.
+                    return if cwd.is_dir() {
+                        write!(f, ": not installed, or not on PATH")
+                    } else {
+                        write!(f, " in {}: that directory does not exist", cwd.display())
+                    };
+                }
+                write!(f, " in {}: {source}", cwd.display())
+            }
         }
     }
 }
@@ -211,7 +243,7 @@ impl std::error::Error for RunError {
         match self {
             RunError::MissingArg(e) => Some(e),
             RunError::Dependency(e) => Some(e),
-            RunError::Io(e) => Some(e),
+            RunError::Io { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -383,6 +415,7 @@ impl TaskFile {
         };
 
         Ok(Invocation {
+            task: job.name.clone(),
             program: program.to_string(),
             args: vec![flag.to_string(), script],
             env,
@@ -422,6 +455,52 @@ impl TaskFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn io_error(kind: std::io::ErrorKind, cwd: &str) -> RunError {
+        RunError::Io {
+            task: "deploy".into(),
+            program: "ruby".into(),
+            cwd: PathBuf::from(cwd),
+            source: std::io::Error::new(kind, "boom"),
+        }
+    }
+
+    /// The message was "No such file or directory (os error 2)" and nothing
+    /// else: in a `Requires:` chain it named neither the failing step nor the
+    /// thing that was missing, and read as though a file the *script* wanted was
+    /// absent, which is the wrong problem entirely.
+    #[test]
+    fn a_spawn_failure_says_which_task_and_which_program() {
+        let msg = io_error(std::io::ErrorKind::NotFound, ".").to_string();
+        assert!(msg.contains("deploy"), "{msg}");
+        assert!(msg.contains("ruby"), "{msg}");
+    }
+
+    /// Two NotFounds with the same words and completely different fixes: the
+    /// interpreter is missing, or the directory it would run in is. The current
+    /// directory exists, so the first reading is the right one.
+    #[test]
+    fn a_missing_interpreter_and_a_missing_directory_read_differently() {
+        let missing_program = io_error(std::io::ErrorKind::NotFound, ".").to_string();
+        assert!(missing_program.contains("not on PATH"), "{missing_program}");
+
+        let missing_dir =
+            io_error(std::io::ErrorKind::NotFound, "/no/such/place/at/all").to_string();
+        assert!(
+            missing_dir.contains("that directory does not exist"),
+            "{missing_dir}"
+        );
+        assert!(
+            missing_dir.contains("/no/such/place/at/all"),
+            "{missing_dir}"
+        );
+    }
+
+    #[test]
+    fn another_spawn_failure_still_reports_the_underlying_error() {
+        let msg = io_error(std::io::ErrorKind::PermissionDenied, ".").to_string();
+        assert!(msg.contains("deploy") && msg.contains("boom"), "{msg}");
+    }
     use crate::parse::parse;
 
     fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

@@ -117,7 +117,7 @@ fn run_plan_captured(plan: &[Invocation]) -> Result<std::process::Output, RunErr
     let mut stderr = Vec::new();
     let mut status = None;
     for inv in plan {
-        let out = inv.run_captured().map_err(RunError::Io)?;
+        let out = inv.run_captured().map_err(|e| inv.spawn_error(e))?;
         stdout.extend_from_slice(&out.stdout);
         stderr.extend_from_slice(&out.stderr);
         let failed = !out.status.success();
@@ -150,7 +150,7 @@ pub fn run(
     let plan = plan_invocations(&order, name, args, cwd, |n| trusted_lookup(files, n))?;
     let mut last = None;
     for inv in &plan {
-        let status = inv.run_inherit().map_err(RunError::Io)?;
+        let status = inv.run_inherit().map_err(|e| inv.spawn_error(e))?;
         if !status.success() {
             return Ok(status);
         }
@@ -237,6 +237,16 @@ pub fn run_agent(
 }
 
 impl Invocation {
+    /// Wrap a spawn failure with which task and which program it was.
+    fn spawn_error(&self, source: std::io::Error) -> RunError {
+        RunError::Io {
+            task: self.task.clone(),
+            program: self.program.clone(),
+            cwd: self.cwd.clone(),
+            source,
+        }
+    }
+
     /// The `std::process::Command` for this invocation (program, argv, env, cwd).
     fn command(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.program);
