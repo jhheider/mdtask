@@ -952,6 +952,45 @@ fn heading(line: &str) -> Option<String> {
 
 /// Apply a body line: a recognized `Key: value` sets metadata (case-insensitive
 /// key, xc vocabulary); anything else is description. `Env:` before the first job
+/// The metadata keys, and the aliases each accepts.
+const KEYS: &[&str] = &[
+    "env",
+    "environment",
+    "opts",
+    "options",
+    "args",
+    "arguments",
+    "requires",
+    "req",
+    "agent",
+];
+
+/// The key `word` was probably meant to be, if it is close enough to one.
+///
+/// Deliberately narrow: a singular/plural slip or one wrong character. Anything
+/// looser would start warning about ordinary prose, which is the thing this
+/// format has to live alongside.
+fn nearest_key(word: &str) -> Option<&'static str> {
+    KEYS.iter()
+        .copied()
+        .find(|k| {
+            // "arg" vs "args", "require" vs "requires", "opt" vs "opts".
+            k.strip_suffix('s') == Some(word)
+                || word.strip_suffix('s') == Some(*k)
+                || k.starts_with(word) && k.len() == word.len() + 1
+        })
+        .or_else(|| KEYS.iter().copied().find(|k| edit_distance_one(k, word)))
+}
+
+/// Whether two words differ by exactly one substitution. Cheap, and enough for
+/// the typos that actually happen in a metadata key.
+fn edit_distance_one(a: &str, b: &str) -> bool {
+    if a.len() != b.len() || a == b {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count() == 1
+}
+
 /// accumulates into the hoisted `file_env`.
 fn apply_line(
     line: &str,
@@ -972,7 +1011,10 @@ fn apply_line(
             }
             "opts" | "options" => {
                 if let Some(t) = job {
-                    t.opts = value.split_whitespace().map(str::to_string).collect();
+                    // Extend, not assign. Assigning meant a second `Opts:` line
+                    // silently erased the first, and a second `Requires:` line
+                    // silently dropped a dependency while still exiting 0.
+                    t.opts.extend(value.split_whitespace().map(str::to_string));
                     for flag in &t.opts {
                         if !KNOWN_OPTS.contains(&flag.as_str()) {
                             warnings.push(format!(
@@ -986,17 +1028,18 @@ fn apply_line(
             }
             "args" | "arguments" => {
                 if let Some(t) = job {
-                    t.args = parse_args(value);
+                    t.args.extend(parse_args(value));
                 }
                 return;
             }
             "requires" | "req" => {
                 if let Some(t) = job {
-                    t.requires = value
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                    t.requires.extend(
+                        value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
                 }
                 return;
             }
@@ -1006,7 +1049,22 @@ fn apply_line(
                 }
                 return;
             }
-            _ => {}
+            other => {
+                // A near-miss of a real key is a typo, not prose. `Arg:`,
+                // `Require:` and `Opt:` all used to vanish into the description
+                // with no warning, so a declared dependency never ran and a
+                // declared argument never existed, silently and with exit 0.
+                //
+                // Only near-misses warn. An ordinary sentence starting "Note:"
+                // must stay description, or the format cannot coexist with the
+                // prose it is written in.
+                if let Some(meant) = nearest_key(other) {
+                    warnings.push(format!(
+                        "unknown metadata key {other:?}; did you mean {meant:?}? \
+                         (treating the line as description)"
+                    ));
+                }
+            }
         }
     }
     // Description (only within a job; drop stray prose outside one).
@@ -1401,6 +1459,49 @@ mod tests {
 
     /// An unrecognized language is still a task, run as `sh`, and warned about.
     /// Forgiving is deliberate: `shell-session` and `bash5` should work.
+    /// Repeated metadata accumulates. Assigning meant the second line silently
+    /// erased the first, so a declared dependency never ran and the task still
+    /// exited 0.
+    #[test]
+    fn repeated_metadata_lines_accumulate() {
+        let tf = parse("## t\n\nRequires: alpha\nRequires: beta\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.jobs[0].requires, vec!["alpha", "beta"]);
+
+        let tf = parse("## t\n\nArgs: a\nArgs: b\n\n```sh\ntrue\n```\n");
+        let names: Vec<_> = tf.jobs[0].args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// A near-miss of a real key is a typo, and used to vanish into the
+    /// description with no warning at all.
+    #[test]
+    fn a_misspelled_metadata_key_warns() {
+        for (typo, meant) in [("Require", "requires"), ("Arg", "args"), ("Opt", "opts")] {
+            let src = format!("## t\n\n{typo}: x\n\n```sh\ntrue\n```\n");
+            let tf = parse(&src);
+            assert!(
+                tf.warnings.iter().any(|w| w.contains(meant)),
+                "{typo}: should suggest {meant}, warnings were {:?}",
+                tf.warnings
+            );
+        }
+    }
+
+    /// ...but ordinary prose that happens to start with a word and a colon must
+    /// stay prose, or the format cannot live in the documentation it claims to.
+    #[test]
+    fn ordinary_prose_is_not_mistaken_for_metadata() {
+        let tf = parse(
+            "## t\n\nNote: this is a sentence.\nWarning: so is this.\nSee: the docs.\n\n```sh\ntrue\n```\n",
+        );
+        assert!(
+            tf.warnings.is_empty(),
+            "prose should not warn, got {:?}",
+            tf.warnings
+        );
+        assert!(tf.jobs[0].description.contains("Note: this is a sentence."));
+    }
+
     #[test]
     fn an_unknown_language_is_still_a_task_and_warns() {
         let tf = parse("## a\n\n```shell-session\ntrue\n```\n");

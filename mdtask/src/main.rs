@@ -66,14 +66,21 @@ fn main() -> ExitCode {
     }
 
     // -f/--file FILE selects one task file (no walk); else walk up from cwd.
+    //
+    // Only in the leading position, like -h and -V above. Scanning all of argv
+    // meant a task's own arguments were stolen: `mdtask run -f config.yml` tried
+    // to read `config.yml` as a task file, and any task taking a `-f` flag of its
+    // own (`grep -f`, `docker -f`, `rsync -f`) was unusable with no way to
+    // escape. Everything after the task name belongs to the task, which is what
+    // this module's own docs promise.
     let mut file: Option<PathBuf> = None;
-    if let Some(i) = args.iter().position(|a| a == "-f" || a == "--file") {
-        if i + 1 >= args.len() {
-            eprintln!("mdtask: {} needs a path", args[i]);
+    if matches!(args.first().map(String::as_str), Some("-f" | "--file")) {
+        if args.len() < 2 {
+            eprintln!("mdtask: {} needs a path", args[0]);
             return ExitCode::FAILURE;
         }
-        file = Some(PathBuf::from(args.remove(i + 1)));
-        args.remove(i);
+        file = Some(PathBuf::from(args.remove(1)));
+        args.remove(0);
     }
 
     // Discover the layered task files, nearest first.
@@ -112,6 +119,26 @@ fn main() -> ExitCode {
     }
 
     let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+
+    // Surplus positionals are a typo, not an offering. They used to be dropped
+    // in silence, so a stale flag or a second task name after the first ran the
+    // task anyway and exited 0. Checked here rather than in core: the library
+    // binding is a mechanism, and an embedder passing a vector is doing so
+    // deliberately, but a person typing extra words at a shell is not.
+    if let Some(job) = job_named(&files, &name) {
+        let declared = job.args.len();
+        let takes_rest = job.args.last().is_some_and(|a| a.variadic);
+        if !takes_rest && positional.len() > declared {
+            eprintln!(
+                "mdtask: {} unexpected argument(s) [{}] (usage: {})",
+                positional.len() - declared,
+                positional[declared..].join(", "),
+                invocation_usage(&name, job)
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Core owns the whole run: resolve the target and its `Requires:` chain across
@@ -139,10 +166,23 @@ fn report(files: &[(PathBuf, TaskFile)], name: &str, e: &RunError) {
     match e {
         RunError::NotFound(n) => eprintln!("mdtask: no task named {n:?}"),
         RunError::MissingArg(_) => match job_named(files, name) {
-            Some(job) => eprintln!("mdtask: {e} (usage: mdtask {name} {})", usage(job)),
+            Some(job) => eprintln!("mdtask: {e} (usage: {})", invocation_usage(name, job)),
             None => eprintln!("mdtask: {e}"),
         },
         _ => eprintln!("mdtask: {e}"),
+    }
+}
+
+/// How to invoke a job: `mdtask <name>` plus its declared arguments, with no
+/// trailing space when it declares none. The old form always appended a space
+/// and the argument list, so a task with no arguments advertised itself as
+/// `mdtask release ` with nothing after it.
+fn invocation_usage(name: &str, job: &Job) -> String {
+    let args = usage(job);
+    if args.is_empty() {
+        format!("mdtask {name}")
+    } else {
+        format!("mdtask {name} {args}")
     }
 }
 
