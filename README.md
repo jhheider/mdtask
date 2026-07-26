@@ -243,10 +243,14 @@ project root just calls it directly.)
 
 ### MCP
 
-Built with `--features mcp`, `mdtask mcp` serves the working set to an MCP client
+Built with `--features mcp`, `mdtask --mcp` serves the working set to an MCP client
 (Claude Desktop or Code) over stdio, so an agent can run your tasks. It is **fail
 closed**: only tasks marked `Agent: allow` are exposed, everything else is
 invisible and unrunnable.
+
+`mdtask mcp` does the same, but yields to a task actually named `mcp`. A task
+file is the authority on what its own task names mean, so a reserved word does
+not get to shadow one silently. Use `--mcp` when you want the server regardless.
 
 - `list_tasks` enumerates **only** the allowed tasks (`agent_jobs`), so the rest
   are not even discoverable.

@@ -42,7 +42,8 @@ mdtask runs tasks defined in markdown (tasks.md / maskfile.md / README.md).
 Usage:
   mdtask                    list the available tasks
   mdtask <name> [args...]   run a task; positional args fill its `Args:` in order
-  mdtask mcp                serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask --mcp              serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask mcp                the same, unless a task is named `mcp`, which wins
   mdtask -s, --show NAME    print a task's script and metadata without running it
   mdtask -f, --file FILE    use a specific task file (no directory walk)
   mdtask -V, --version      print the version
@@ -84,6 +85,13 @@ fn main() -> ExitCode {
         args.remove(0);
     }
 
+    // --mcp always serves, whatever the task file contains. The bare `mcp`
+    // subcommand below is the older spelling and yields to a task of that name.
+    let serve_mcp = matches!(args.first().map(String::as_str), Some("--mcp"));
+    if serve_mcp {
+        args.remove(0);
+    }
+
     // --show NAME: print the task instead of running it. After -f, so
     // `mdtask -f other.md --show build` works, and leading-position-only like
     // every other flag, so a task's own `--show` still reaches the task.
@@ -122,6 +130,10 @@ fn main() -> ExitCode {
         }
     }
 
+    if serve_mcp {
+        return run_mcp(&files);
+    }
+
     if let Some(name) = show_name {
         return show(&files, &name);
     }
@@ -130,9 +142,12 @@ fn main() -> ExitCode {
         return list(&files);
     };
 
-    // The `mcp` subcommand serves the agent-allowed tasks over stdio; it is checked
-    // before task dispatch.
-    if name == "mcp" {
+    // The `mcp` subcommand serves the agent-allowed tasks over stdio, but only
+    // when the task file does not define a task by that name. A task file is the
+    // authority on what its task names mean, and a reserved word that silently
+    // shadows one is a name you cannot use and are never told about. `--mcp`
+    // above is the unambiguous spelling.
+    if name == "mcp" && job_named(&files, "mcp").is_none() {
         return run_mcp(&files);
     }
 
