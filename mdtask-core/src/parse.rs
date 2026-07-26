@@ -10,7 +10,7 @@ pub fn parse(src: &str) -> TaskFile {
     let mut file = TaskFile::default();
     let mut cur: Option<Job> = None;
     let mut in_fence = false;
-    let mut fence_marker = "";
+    let mut fence_marker = Fence { ch: b'`', len: 3 };
     let mut have_script = false; // first fence per job only
     let mut script = String::new();
     // Whether a `Key: value` line here is metadata or just a sentence that
@@ -133,24 +133,47 @@ fn finalize(job: Option<Job>, file: &mut TaskFile) {
     file.jobs.push(t);
 }
 
-/// The opening fence marker if `line` starts one, else `None`.
-fn opening_fence(line: &str) -> Option<&'static str> {
-    let t = line.trim_start();
-    if t.starts_with("```") {
-        Some("```")
-    } else if t.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
-    }
+/// An open fence: which character, and how many of them.
+///
+/// The length matters. CommonMark closes a fence only with a run of *at least
+/// as many* of the same character, which is how a markdown block can contain
+/// markdown blocks: fence the outer one with four backticks and the inner
+/// three-backtick fences are ordinary content. Discarding the length made every
+/// fence three long, so an inner ``` closed the outer block early. mdtask's own
+/// README, whose opening example is markdown inside markdown, parsed as a task
+/// named "mdtask" whose script was the first half of the sample and whose
+/// language was "`markdown".
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fence {
+    ch: u8,
+    len: usize,
 }
 
-/// Whether `line` is a bare closing fence for `marker`: only the fence char, no
-/// info string, per CommonMark's closing rule.
-fn is_closing_fence(line: &str, marker: &str) -> bool {
-    let ch = marker.as_bytes()[0];
+/// The opening fence if `line` starts one, else `None`.
+fn opening_fence(line: &str) -> Option<Fence> {
+    let t = line.trim_start();
+    let ch = match t.as_bytes().first() {
+        Some(b'`') => b'`',
+        Some(b'~') => b'~',
+        _ => return None,
+    };
+    let len = t.bytes().take_while(|b| *b == ch).count();
+    if len < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not itself contain a backtick, which is
+    // what keeps inline code (`` `x` ``) from opening a block.
+    if ch == b'`' && t[len..].contains('`') {
+        return None;
+    }
+    Some(Fence { ch, len })
+}
+
+/// Whether `line` closes `fence`: only the fence character, at least as many of
+/// them as opened it, and no info string, per CommonMark's closing rule.
+fn is_closing_fence(line: &str, fence: Fence) -> bool {
     let t = line.trim();
-    t.len() >= 3 && t.bytes().all(|b| b == ch)
+    t.len() >= fence.len && t.bytes().all(|b| b == fence.ch)
 }
 
 /// Whether `line` opens a markdown list item (`-`, `*`, `+`, or `1.` / `1)`).
@@ -172,11 +195,10 @@ fn opens_list_item(line: &str) -> bool {
     false
 }
 
-/// The info-string language after the opening fence marker.
-fn info_string(line: &str, marker: &str) -> String {
-    line.trim_start()
-        .strip_prefix(marker)
-        .unwrap_or("")
+/// The info-string language after the opening fence.
+fn info_string(line: &str, fence: Fence) -> String {
+    let t = line.trim_start();
+    t[fence.len.min(t.len())..]
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -621,6 +643,54 @@ fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CommonMark closes a fence only with a run of *at least as many* of the
+    /// same character. That is how a markdown block contains markdown blocks,
+    /// and it is what mdtask's own README needs: fence the sample with four
+    /// backticks and the inner three-backtick fences are content.
+    ///
+    /// Before this, every fence was three long, so the inner bare ``` closed the
+    /// outer block: the README parsed as a task named "mdtask" whose script was
+    /// half the sample and whose language was "`markdown".
+    #[test]
+    fn a_longer_fence_is_not_closed_by_a_shorter_one() {
+        let tf = parse("## t\n\n````markdown\n# inner\n\n```sh\necho nested\n```\n````\n");
+        assert_eq!(tf.jobs[0].lang, "markdown", "not \"`markdown\"");
+        let script = &tf.jobs[0].script;
+        assert!(
+            script.contains("```sh"),
+            "the inner fence is content: {script:?}"
+        );
+        assert!(script.contains("echo nested"), "{script:?}");
+        assert!(
+            !script.contains("````"),
+            "and the outer one is not: {script:?}"
+        );
+    }
+
+    #[test]
+    fn a_shorter_fence_is_still_closed_normally() {
+        let tf = parse("## t\n\n```sh\ntrue\n````\n");
+        assert_eq!(tf.jobs[0].script.trim(), "true", "a longer run closes it");
+        assert!(tf.warnings.is_empty(), "{:?}", tf.warnings);
+    }
+
+    #[test]
+    fn tildes_track_their_own_length() {
+        let tf = parse("## t\n\n~~~~sh\n~~~\nstill inside\n~~~~\n");
+        assert!(tf.jobs[0].script.contains("still inside"));
+    }
+
+    /// A backtick fence's info string may not contain a backtick, which is what
+    /// keeps a line of inline code from opening a block.
+    #[test]
+    fn inline_code_does_not_open_a_fence() {
+        assert!(opening_fence("```rust").is_some());
+        assert!(opening_fence("``` rust ```").is_none());
+        assert!(opening_fence("``").is_none(), "two is not a fence");
+        // Tildes have no such restriction in CommonMark.
+        assert!(opening_fence("~~~ a ~ b").is_some());
+    }
 
     /// The silent corruption this replaced: `FLAGS=-a,-b` set `FLAGS` to `-a`
     /// and threw `-b` away without a word, because the fragment had no `=` and
