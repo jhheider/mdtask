@@ -385,7 +385,7 @@ fn apply_line(
         let value = value.trim();
         match key.as_str() {
             "env" | "environment" => {
-                let pairs = parse_env(value);
+                let pairs = parse_env(value, warnings);
                 match job {
                     Some(t) => t.env.extend(pairs),
                     None => file_env.extend(pairs), // hoisted
@@ -491,19 +491,59 @@ fn split_key(line: &str) -> Option<(String, &str)> {
     Some((key.to_ascii_lowercase(), &line[colon + 1..]))
 }
 
-/// Parse an `Env:` value: comma-separated `KEY=VALUE` pairs.
-fn parse_env(value: &str) -> Vec<(String, String)> {
-    value
-        .split(',')
-        .filter_map(|p| {
-            let (k, v) = p.split_once('=')?;
-            let k = k.trim();
-            if k.is_empty() {
-                return None;
+/// Parse an `Env:` value into `KEY=VALUE` pairs, comma-separated.
+///
+/// A value may be quoted, which is the only way to write one containing a
+/// comma. Without it, `Env: FLAGS=-a,-b` set `FLAGS` to `-a` and threw `-b`
+/// away without a word, because the fragment had no `=` and the old parser
+/// dropped anything that did not. Silently corrupting a value is worse than
+/// refusing it, so a fragment that cannot be a pair now warns.
+fn parse_env(value: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in split_pairs(value) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = entry.split_once('=') else {
+            warnings.push(format!(
+                "`Env:` entry {entry:?} has no `=`, so it was ignored; entries are \
+                 comma-separated KEY=VALUE, and a value containing a comma has to be \
+                 quoted (KEY=\"a,b\")"
+            ));
+            continue;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            warnings.push(format!(
+                "`Env:` entry {entry:?} has an empty key, so it was ignored"
+            ));
+            continue;
+        }
+        out.push((k.to_string(), unquote(v).to_string()));
+    }
+    out
+}
+
+/// Split an `Env:` value on the commas that separate pairs, ignoring any inside
+/// a quoted run.
+fn split_pairs(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (i, c) in value.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ',') => {
+                out.push(&value[start..i]);
+                start = i + 1;
             }
-            Some((k.to_string(), v.trim().to_string()))
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
 }
 
 /// Parse an `Args:` value into declared [`Arg`]s (just's syntax): `name` is
@@ -581,6 +621,57 @@ fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The silent corruption this replaced: `FLAGS=-a,-b` set `FLAGS` to `-a`
+    /// and threw `-b` away without a word, because the fragment had no `=` and
+    /// anything without one was dropped.
+    #[test]
+    fn an_env_value_with_a_comma_can_be_quoted() {
+        let tf = parse("## t\n\nEnv: FLAGS=\"-a,-b\", TIER=prod\n\n```sh\ntrue\n```\n");
+        assert_eq!(
+            tf.jobs[0].env,
+            vec![
+                ("FLAGS".into(), "-a,-b".into()),
+                ("TIER".into(), "prod".into())
+            ]
+        );
+        assert!(tf.warnings.is_empty(), "{:?}", tf.warnings);
+    }
+
+    #[test]
+    fn single_quotes_work_too() {
+        let tf = parse("## t\n\nEnv: FLAGS='-a,-b'\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.jobs[0].env, vec![("FLAGS".into(), "-a,-b".into())]);
+    }
+
+    #[test]
+    fn an_env_fragment_that_cannot_be_a_pair_warns() {
+        let tf = parse("## t\n\nEnv: FLAGS=-a,-b\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.jobs[0].env, vec![("FLAGS".into(), "-a".into())]);
+        assert!(
+            tf.warnings.iter().any(|w| w.contains("has no `=`")),
+            "{:?}",
+            tf.warnings
+        );
+    }
+
+    #[test]
+    fn an_env_entry_with_an_empty_key_warns() {
+        let tf = parse("## t\n\nEnv: =orphan\n\n```sh\ntrue\n```\n");
+        assert!(tf.jobs[0].env.is_empty());
+        assert!(
+            tf.warnings.iter().any(|w| w.contains("empty key")),
+            "{:?}",
+            tf.warnings
+        );
+    }
+
+    /// An `=` inside a quoted value is part of the value, not a second pair.
+    #[test]
+    fn an_env_value_may_contain_an_equals_sign() {
+        let tf = parse("## t\n\nEnv: OPTS=\"a=1,b=2\"\n\n```sh\ntrue\n```\n");
+        assert_eq!(tf.jobs[0].env, vec![("OPTS".into(), "a=1,b=2".into())]);
+    }
 
     fn req_names(reqs: &[Requirement]) -> Vec<&str> {
         reqs.iter().map(|r| r.name.as_str()).collect()

@@ -101,7 +101,9 @@ overlap as a convenience, not a contract.
       this file's own. See [Finding task files](#finding-task-files).
 
     Using one where the other belongs warns and says which way round it goes.
-  - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
+  - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). Quote a value to put a
+    comma in it (`FLAGS="-a,-b"`); a fragment that cannot be a pair is reported
+    as a warning rather than dropped. An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
   - `Requires:` lists task dependencies, comma-separated. The CLI runs them
     first, resolved across the layered files, dependencies before dependents,
