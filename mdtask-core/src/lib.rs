@@ -925,6 +925,16 @@ pub fn parse(src: &str) -> TaskFile {
         }
         if line.trim().is_empty() {
             block_start = true;
+            // Keep the paragraph break. Descriptions used to be a run of lines
+            // with every blank dropped, so nothing downstream could tell where
+            // the opening thought ended: a listing had no first paragraph to
+            // show, only a first hard-wrapped line, which is a fragment.
+            if let Some(t) = cur.as_mut()
+                && !t.description.is_empty()
+                && !t.description.ends_with("\n\n")
+            {
+                t.description.push('\n');
+            }
             continue;
         }
         let was_meta = apply_line(
@@ -2013,6 +2023,18 @@ true
         for bad in ["-not a bullet", "a - b", "1.5 is a number", "", "text"] {
             assert!(!opens_list_item(bad), "{bad:?}");
         }
+    }
+
+    /// A description keeps its paragraph breaks, so a consumer can tell where
+    /// the opening thought ends. Dropping blanks left one undifferentiated run
+    /// of lines, and the only "summary" available was a hard-wrap fragment.
+    #[test]
+    fn a_description_keeps_its_paragraph_breaks() {
+        let tf = parse("## t\n\nFirst thought,\nwrapped.\n\nSecond thought.\n\n```sh\ntrue\n```\n");
+        let d = &tf.jobs[0].description;
+        let paras: Vec<&str> = d.split("\n\n").filter(|p| !p.trim().is_empty()).collect();
+        assert_eq!(paras.len(), 2, "description was {d:?}");
+        assert_eq!(paras[0].trim(), "First thought,\nwrapped.");
     }
 
     #[test]

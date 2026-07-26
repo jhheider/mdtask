@@ -27,7 +27,7 @@
 //! spawn) live in `mdtask-core`; this binary just resolves files and calls
 //! `mdtask_core::run`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mdtask_core::{Job, RunError, TaskFile};
@@ -205,25 +205,154 @@ fn run_mcp(_files: &[(PathBuf, TaskFile)]) -> ExitCode {
 
 /// List tasks across the layered files, nearest first, each name once (a nearer
 /// definition shadows a farther one).
+///
+/// Two shapes, because a listing has two audiences. On a terminal it is a padded
+/// column with the description wrapped under it, grouped by source file when
+/// more than one contributes: which file a task came from is the first thing you
+/// need when a name resolves to something you did not expect. Piped, it stays
+/// one tab-separated line per task, so it is still greppable.
+///
+/// Neither shape truncates. The description used to be cut at its first physical
+/// line, which in a hard-wrapped markdown paragraph is not a sentence, or even a
+/// clause: listings ended mid-phrase on "One license only permits one".
 fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
-    let mut any = false;
-    for (_, tf) in files {
+    let mut groups: Vec<(&Path, Vec<(String, String)>)> = Vec::new();
+    for (path, tf) in files {
+        let mut rows = Vec::new();
         for job in tf.jobs() {
             if seen.insert(job.name.clone()) {
-                let a = usage(job);
-                let sep = if a.is_empty() { "" } else { " " };
-                let desc = job.description.lines().next().unwrap_or("");
-                println!("{}{sep}{a}\t{desc}", job.name);
-                any = true;
+                let args = usage(job);
+                let sep = if args.is_empty() { "" } else { " " };
+                rows.push((
+                    format!("{}{sep}{args}", job.name),
+                    summary(&job.description),
+                ));
+            }
+        }
+        if !rows.is_empty() {
+            groups.push((path.as_path(), rows));
+        }
+    }
+
+    if groups.is_empty() {
+        eprintln!("mdtask: no tasks found");
+        return ExitCode::FAILURE;
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        for (_, rows) in &groups {
+            for (label, desc) in rows {
+                println!("{label}\t{desc}");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let width = terminal_width();
+    // Wide enough for the labels, but never so wide that the description is
+    // squeezed into a gutter by one long task name.
+    let longest = groups
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(l, _)| l.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let column = longest.min(width / 3).max(1) + 2;
+    let show_source = groups.len() > 1;
+
+    for (i, (path, rows)) in groups.iter().enumerate() {
+        if show_source {
+            if i > 0 {
+                println!();
+            }
+            println!("{}", display_path(path));
+        }
+        for (label, desc) in rows {
+            let indent = if show_source { 2 } else { 0 };
+            let pad = " ".repeat(indent);
+            if desc.is_empty() {
+                println!("{pad}{label}");
+                continue;
+            }
+            // A label longer than the column gets the description on the next
+            // line rather than shoving the whole row out of alignment.
+            let lines = wrap(desc, width.saturating_sub(column + indent).max(20));
+            let mut lines = lines.iter();
+            if label.chars().count() < column {
+                let gap = column - label.chars().count();
+                println!("{pad}{label}{}{}", " ".repeat(gap), lines.next().unwrap());
+            } else {
+                println!("{pad}{label}");
+            }
+            for rest in lines {
+                println!("{pad}{}{rest}", " ".repeat(column));
             }
         }
     }
-    if any {
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("mdtask: no tasks found");
-        ExitCode::FAILURE
+    ExitCode::SUCCESS
+}
+
+/// A task's description as one line: its first paragraph, unwrapped.
+///
+/// Markdown descriptions are hard-wrapped prose, so the first *line* is an
+/// arbitrary fragment. The first *paragraph* is the author's opening thought,
+/// which is what a listing wants.
+fn summary(description: &str) -> String {
+    description
+        .lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Greedy word wrap. Counts characters, not display columns: mdtask has no
+/// dependencies and a task description is overwhelmingly ASCII, so a wide
+/// character wraps a column early rather than pulling in a unicode-width crate.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Terminal width from `COLUMNS`, else 80.
+///
+/// The ioctl would need libc, and this binary's whole dependency list is
+/// `serde_json`, behind an off-by-default feature. Eighty is right when the
+/// variable is absent and a shell that exports it gets the real thing.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 40)
+        .unwrap_or(80)
+}
+
+/// A task file's path, relative to the current directory when that is shorter.
+fn display_path(path: &Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let rel = cwd
+        .as_ref()
+        .and_then(|c| path.strip_prefix(c).ok())
+        .map(|p| p.display().to_string());
+    match rel {
+        Some(r) if !r.is_empty() => r,
+        _ => path.display().to_string(),
     }
 }
 
@@ -243,4 +372,61 @@ fn usage(job: &Job) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this replaced: a listing showed the first *physical* line of a
+    /// hard-wrapped markdown paragraph, which ends wherever the author's editor
+    /// happened to wrap. Real output read "One license only permits one".
+    #[test]
+    fn summary_unwraps_the_first_paragraph() {
+        let desc = "Start the local dev server. One license only permits one\n\
+                    instance at a time.\n\
+                    \n\
+                    A second paragraph, which the listing does not want.\n";
+        assert_eq!(
+            summary(desc),
+            "Start the local dev server. One license only permits one instance at a time."
+        );
+    }
+
+    #[test]
+    fn summary_of_nothing_is_nothing() {
+        assert_eq!(summary(""), "");
+        assert_eq!(summary("\n\n"), "");
+    }
+
+    #[test]
+    fn wrap_breaks_on_words_and_fills() {
+        assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
+    }
+
+    /// A URL or a long path has no break in it. Overflowing the column is the
+    /// right failure: the alternative is severing something meant to be copied.
+    #[test]
+    fn wrap_does_not_break_inside_a_word() {
+        let long = "https://example.com/a/very/long/path/indeed";
+        assert_eq!(wrap(long, 10), [long]);
+    }
+
+    #[test]
+    fn wrap_always_returns_at_least_one_line() {
+        assert_eq!(wrap("", 10), [""]);
+    }
+
+    #[test]
+    fn terminal_width_falls_back_when_columns_is_unusable() {
+        // Not a number, absurdly narrow, or absent: 80 either way. A width of 3
+        // would put one word per line under a column that does not fit.
+        for bad in ["", "wide", "0", "12"] {
+            unsafe { std::env::set_var("COLUMNS", bad) };
+            assert_eq!(terminal_width(), 80, "COLUMNS={bad:?}");
+        }
+        unsafe { std::env::set_var("COLUMNS", "120") };
+        assert_eq!(terminal_width(), 120);
+        unsafe { std::env::remove_var("COLUMNS") };
+    }
 }
