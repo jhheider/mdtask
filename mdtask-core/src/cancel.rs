@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Long enough for a `trap` to remove a temporary file, short enough that a
 /// client asking to cancel does not conclude nothing happened.
+#[cfg(unix)]
 const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A handle for stopping a run from another thread.

@@ -31,7 +31,7 @@ use std::sync::mpsc;
 use mdtask_core::{Cancel, TaskFile, agent_jobs};
 use serde_json::{Value, json};
 
-use crate::usage;
+use crate::{summary, usage};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -230,11 +230,6 @@ fn handle_call(files: &[(PathBuf, TaskFile)], params: Option<&Value>) -> Value {
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let arguments = params
-        .and_then(|p| p.get("arguments"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let _ = &arguments;
     match tool {
         "list_tasks" => text_result(list_tasks_text(files), false),
         // `run_task` is routed by the loop, not here: it needs a cancel handle
@@ -263,13 +258,17 @@ fn list_tasks_text(files: &[(PathBuf, TaskFile)]) -> String {
     for job in jobs {
         let u = usage(job);
         let sep = if u.is_empty() { "" } else { " " };
-        let desc = job.description.lines().next().unwrap_or("");
+        // The first paragraph, unwrapped, not the first physical line. These
+        // descriptions are hard-wrapped markdown, so a line is a fragment: the
+        // agent choosing between tools was reading things like "One license only
+        // permits one". Same treatment as the CLI listing, deliberately.
+        let desc = summary(&job.description);
         s.push_str(&job.name);
         s.push_str(sep);
         s.push_str(&u);
         if !desc.is_empty() {
             s.push('\t');
-            s.push_str(desc);
+            s.push_str(&desc);
         }
         s.push('\n');
     }
