@@ -30,13 +30,15 @@
 //! CommonMark dependency), so a `#` or `Key:` inside a fenced block is never
 //! mistaken for structure.
 
+mod cancel;
 mod deps;
 mod discover;
 mod model;
 mod parse;
 mod run;
 
+pub use cancel::Cancel;
 pub use discover::find_task_files;
 pub use model::{Arg, DepError, Job, MissingArg, Requirement, RunError, TaskFile};
 pub use parse::parse;
-pub use run::{agent_jobs, run, run_agent, run_captured};
+pub use run::{agent_jobs, run, run_agent, run_agent_cancellable, run_captured};

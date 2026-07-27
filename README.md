@@ -264,6 +264,20 @@ invisible and unrunnable.
 file is the authority on what its own task names mean, so a reserved word does
 not get to shadow one silently. Use `--mcp` when you want the server regardless.
 
+The server stays responsive while a task runs: `ping` is answered, and a second
+`run_task` runs alongside the first rather than queueing behind it.
+`notifications/cancelled` is honoured, and the task is stopped rather than merely
+abandoned. Each task runs in its own process group and cancelling signals the
+group (`SIGTERM`, then `SIGKILL` after a two second grace), so a script's
+children go down with it instead of being orphaned while the client is told the
+task stopped. Closing stdin cancels everything still running, since the client
+is gone.
+
+The library side of that is `run_agent_cancellable` and the `Cancel` handle; it
+is also the reason `mdtask-core` has a `libc` dependency on unix. std can put a
+child into its own process group but cannot signal one, and signalling only the
+shell we spawned would leave the actual work running.
+
 - `list_tasks` enumerates **only** the allowed tasks (`agent_jobs`), so the rest
   are not even discoverable.
 - `run_task` calls `run_agent`, which re-checks the allowlist before running, so

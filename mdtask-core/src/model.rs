@@ -183,6 +183,12 @@ pub enum RunError {
     MissingArg(MissingArg),
     /// The `Requires:` chain could not be resolved (a typo or a cycle).
     Dependency(DepError),
+    /// The run was stopped through a [`Cancel`](crate::Cancel) handle.
+    ///
+    /// Distinct from a failing step: nothing went wrong, someone asked for it to
+    /// stop. A caller that treats every non-success as an error would otherwise
+    /// report a cancellation as a task failure.
+    Cancelled,
     /// Spawning a step failed: the interpreter is not installed, or the
     /// directory the task would run in is gone.
     ///
@@ -215,6 +221,7 @@ impl std::fmt::Display for RunError {
                  before an agent can run it. Refused.",
                 args.join(", ")
             ),
+            RunError::Cancelled => write!(f, "cancelled"),
             RunError::MissingArg(e) => e.fmt(f),
             RunError::Dependency(e) => e.fmt(f),
             RunError::Io {

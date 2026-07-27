@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::cancel::Cancel;
 use crate::deps::{Step, dependency_order};
 use crate::model::{Invocation, Job, RunError, TaskFile};
 
@@ -112,14 +113,28 @@ fn plan_invocations<'a>(
 /// steps and stopping on the first non-success step. The returned status is that
 /// step's (or the last step's on full success). The plan always holds the target,
 /// so it is never empty.
-fn run_plan_captured(plan: &[Invocation]) -> Result<std::process::Output, RunError> {
+fn run_plan_captured(
+    plan: &[Invocation],
+    cancel: Option<&Cancel>,
+) -> Result<std::process::Output, RunError> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut status = None;
     for inv in plan {
-        let out = inv.run_captured().map_err(|e| inv.spawn_error(e))?;
+        // Checked before each step as well as during one, so a cancellation
+        // arriving between two steps of a `Requires:` chain stops the chain
+        // rather than being noticed only once the next step is already running.
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(RunError::Cancelled);
+        }
+        let out = inv.run_captured(cancel).map_err(|e| inv.spawn_error(e))?;
         stdout.extend_from_slice(&out.stdout);
         stderr.extend_from_slice(&out.stderr);
+        // A killed step exits non-zero, which is indistinguishable from a
+        // failing one by exit code alone. Ask the handle instead.
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(RunError::Cancelled);
+        }
         let failed = !out.status.success();
         status = Some(out.status);
         if failed {
@@ -172,7 +187,7 @@ pub fn run_captured(
 ) -> Result<std::process::Output, RunError> {
     let order = trusted_order(files, name)?;
     let plan = plan_invocations(&order, name, args, cwd, |n| trusted_lookup(files, n))?;
-    run_plan_captured(&plan)
+    run_plan_captured(&plan, None)
 }
 
 /// The agent gate: run `name` for an MCP or agent surface, captured, failing
@@ -200,6 +215,37 @@ pub fn run_agent(
     name: &str,
     args: &[String],
     cwd: &Path,
+) -> Result<std::process::Output, RunError> {
+    run_agent_inner(files, name, args, cwd, None)
+}
+
+/// [`run_agent`], stoppable through a [`Cancel`] handle held by another thread.
+///
+/// The agent surface is the one that needs this. A person at a terminal has
+/// Ctrl-C; an MCP client has only `notifications/cancelled`, so unless something
+/// else can reach the running task, a task that serves, sleeps, or waits on the
+/// network runs to completion whatever the client says.
+///
+/// The gate is identical to [`run_agent`]'s: same allowlist, same injection
+/// refusal, same in-file dependency resolution. Cancelling mid-chain stops
+/// before the next step and returns [`RunError::Cancelled`], which is
+/// deliberately not a failure: nothing went wrong, someone asked it to stop.
+pub fn run_agent_cancellable(
+    files: &[(PathBuf, TaskFile)],
+    name: &str,
+    args: &[String],
+    cwd: &Path,
+    cancel: &Cancel,
+) -> Result<std::process::Output, RunError> {
+    run_agent_inner(files, name, args, cwd, Some(cancel))
+}
+
+fn run_agent_inner(
+    files: &[(PathBuf, TaskFile)],
+    name: &str,
+    args: &[String],
+    cwd: &Path,
+    cancel: Option<&Cancel>,
 ) -> Result<std::process::Output, RunError> {
     // The nearest definition wins. If it is not allowed (or the name resolves
     // nowhere), refuse: fail closed.
@@ -233,7 +279,7 @@ pub fn run_agent(
     let plan = plan_invocations(&order, name, args, cwd, |n| {
         target_tf.job(n).map(|j| (target_tf, j, dir))
     })?;
-    run_plan_captured(&plan)
+    run_plan_captured(&plan, cancel)
 }
 
 impl Invocation {
@@ -262,8 +308,37 @@ impl Invocation {
     }
 
     /// Run capturing stdout and stderr.
-    fn run_captured(&self) -> std::io::Result<std::process::Output> {
-        self.command().output()
+    /// Run to completion, capturing output.
+    ///
+    /// With a [`Cancel`] handle this spawns into its own **process group** and
+    /// records it, so the signal can reach the script's children rather than
+    /// only the shell that launched them. Without one it is `output()`, which is
+    /// the same thing minus the bookkeeping.
+    fn run_captured(&self, cancel: Option<&Cancel>) -> std::io::Result<std::process::Output> {
+        let Some(cancel) = cancel else {
+            return self.command().output();
+        };
+
+        let mut cmd = self.command();
+        // What `output()` does for us, spelled out because we spawn by hand:
+        // a null stdin (so a task reading stdin gets EOF rather than blocking on
+        // a terminal that is not there) and piped output.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own group, so cancelling reaches everything the script starts.
+            cmd.process_group(0);
+        }
+
+        let child = cmd.spawn()?;
+        // The child leads its own group, so the group id is its pid.
+        cancel.entered(child.id());
+        let out = child.wait_with_output();
+        cancel.left();
+        out
     }
 }
 
@@ -382,6 +457,121 @@ pub(crate) fn substitute(src: &str, args: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the process group. A shell task is `sh -c <script>`,
+    /// so the thing we spawn is a shell and the work is its children. Killing
+    /// only the shell leaves the work running while we report the task stopped,
+    /// which is worse than not cancelling, because it is a lie.
+    ///
+    /// The grandchild writes to a file *after* its sleep, so the file existing
+    /// afterwards proves it survived the cancellation.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_kills_the_script_s_children_not_just_the_shell() {
+        let dir = std::env::temp_dir().join(format!("mdtask-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let witness = dir.join("survived");
+        let src = format!(
+            "## t\n\nAgent: allow\n\n```sh\n(sleep 5; touch {}) &\nwait\n```\n",
+            witness.display()
+        );
+        let files = vec![(dir.join("tasks.md"), parse(&src))];
+
+        let cancel = Cancel::new();
+        let handle = {
+            let cancel = cancel.clone();
+            let dir = dir.clone();
+            std::thread::spawn(move || run_agent_cancellable(&files, "t", &[], &dir, &cancel))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        let result = handle.join().expect("the run thread did not panic");
+        let took = started.elapsed();
+
+        assert!(
+            matches!(result, Err(RunError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(4),
+            "cancelling should not wait out the task: took {took:?}"
+        );
+
+        // Past when the grandchild would have fired had it survived.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let survived = witness.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!survived, "the grandchild outlived the cancellation");
+    }
+
+    /// Cancelling between two steps of a chain stops the chain, rather than
+    /// being noticed only once the next step is already running.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_stops_the_rest_of_a_requires_chain() {
+        let dir = std::env::temp_dir().join(format!("mdtask-chain-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let witness = dir.join("second-ran");
+        let src = format!(
+            "## first\n\n```sh\nsleep 3\n```\n\n## second\n\nAgent: allow\nRequires: first\n\n```sh\ntouch {}\n```\n",
+            witness.display()
+        );
+        let files = vec![(dir.join("tasks.md"), parse(&src))];
+
+        let cancel = Cancel::new();
+        let handle = {
+            let cancel = cancel.clone();
+            let dir = dir.clone();
+            std::thread::spawn(move || run_agent_cancellable(&files, "second", &[], &dir, &cancel))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.cancel();
+        let result = handle.join().expect("the run thread did not panic");
+
+        let ran = witness.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+        assert!(!ran, "the target ran even though the chain was cancelled");
+    }
+
+    /// Cancelling before the run starts must stop it at the first step, not let
+    /// one through because nothing was running when the flag was set.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_cancelled_before_it_starts_never_spawns() {
+        let dir = std::env::temp_dir().join(format!("mdtask-precancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let witness = dir.join("ran");
+        let src = format!(
+            "## t\n\nAgent: allow\n\n```sh\ntouch {}\n```\n",
+            witness.display()
+        );
+        let files = vec![(dir.join("tasks.md"), parse(&src))];
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let result = run_agent_cancellable(&files, "t", &[], &dir, &cancel);
+
+        let ran = witness.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+        assert!(!ran, "the task ran despite being cancelled first");
+    }
+
+    /// Without a handle, nothing changes: the uncancellable path is still the
+    /// one the CLI and every embedder uses.
+    #[test]
+    fn a_run_with_no_handle_still_completes_normally() {
+        let f = files(&[(
+            "tasks.md",
+            "## t\n\nAgent: allow\n\n```sh\necho done\n```\n",
+        )]);
+        let out = run_agent(&f, "t", &[], Path::new(".")).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    }
     use crate::model::DepError;
     use crate::parse::parse;
 

@@ -22,11 +22,13 @@
 //! text. The JSON-RPC loop is hand-rolled over serde_json (newline-delimited
 //! messages, the MCP stdio framing), with no SDK.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
 
-use mdtask_core::{TaskFile, agent_jobs};
+use mdtask_core::{Cancel, TaskFile, agent_jobs};
 use serde_json::{Value, json};
 
 use crate::usage;
@@ -34,45 +36,166 @@ use crate::usage;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Serve the agent-allowed tasks over stdio until stdin closes.
+///
+/// # Why there are threads in here
+///
+/// This loop used to read a line, run the task to completion, then read the next
+/// line. While a task ran the server read nothing at all, which breaks two
+/// things the protocol requires of it:
+///
+/// - `ping` went unanswered, so a client could reasonably decide the server had
+///   died and give up on a task that was running perfectly well.
+/// - `notifications/cancelled` sat unread in the pipe until the task it was
+///   cancelling had already finished, which is not cancellation.
+///
+/// So the reader gets its own thread and each task gets its own thread, and this
+/// loop only routes between them. It is the only writer to stdout, so responses
+/// cannot interleave.
 pub fn run(files: &[(PathBuf, TaskFile)]) -> ExitCode {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<Value>(&line) else {
-            continue; // ignore a malformed line rather than crash the server
-        };
-        let id = req.get("id").cloned();
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let response = match method {
-            "initialize" => Some(ok(
-                id,
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "mdtask", "version": env!("CARGO_PKG_VERSION") },
-                }),
-            )),
-            "tools/list" => Some(ok(id, json!({ "tools": tools_list() }))),
-            "tools/call" => Some(ok(id, handle_call(files, req.get("params")))),
-            "ping" => Some(ok(id, json!({}))),
-            // A notification (no id, e.g. notifications/initialized) gets no
-            // reply; an unknown request does.
-            _ => id.map(|id| {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}})
-            }),
-        };
-        if let Some(resp) = response {
-            if writeln!(stdout, "{resp}").is_err() {
-                break;
+    let (tx, rx) = mpsc::channel::<Event>();
+
+    // Scoped, so the worker threads may borrow `files` instead of the whole task
+    // set being cloned per call.
+    std::thread::scope(|scope| {
+        let reader = tx.clone();
+        scope.spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if reader.send(Event::Line(line)).is_err() {
+                    return; // the loop is gone
+                }
             }
-            let _ = stdout.flush();
+            let _ = reader.send(Event::Eof);
+        });
+
+        let mut stdout = std::io::stdout();
+        // The cancel handle for every request still running, by request id.
+        let mut inflight: HashMap<String, Cancel> = HashMap::new();
+
+        while let Ok(event) = rx.recv() {
+            let response = match event {
+                Event::Eof => break,
+                Event::Done { id, result } => {
+                    // A cancelled request is no longer here, and the protocol
+                    // says its response must not be sent. Dropping the result is
+                    // the whole obligation.
+                    inflight.remove(&key(&id)).map(|_| ok(Some(id), result))
+                }
+                Event::Line(line) => handle_line(&line, files, &tx, scope, &mut inflight),
+            };
+            if let Some(resp) = response {
+                if writeln!(stdout, "{resp}").is_err() {
+                    break;
+                }
+                let _ = stdout.flush();
+            }
         }
-    }
+
+        // stdin closed or stdout broke: the client is gone, so nothing running
+        // on its behalf should outlive it. Without this the scope would wait for
+        // every task to finish on its own, which for a task that serves or
+        // sleeps means never.
+        for (_, cancel) in inflight.drain() {
+            cancel.cancel();
+        }
+    });
     ExitCode::SUCCESS
+}
+
+/// What the loop waits on: a line from the client, or a task that has finished.
+enum Event {
+    Line(String),
+    Done { id: Value, result: Value },
+    Eof,
+}
+
+/// A request id as a map key. Ids may be numbers or strings, and the same id
+/// must key the same way whichever it is.
+fn key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// Route one JSON-RPC message. Returns a response to write, or `None` for a
+/// notification, an unparseable line, or a request whose answer will arrive
+/// later on a worker thread.
+fn handle_line<'a>(
+    line: &str,
+    files: &'a [(PathBuf, TaskFile)],
+    tx: &mpsc::Sender<Event>,
+    scope: &'a std::thread::Scope<'a, '_>,
+    inflight: &mut HashMap<String, Cancel>,
+) -> Option<Value> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    let Ok(req) = serde_json::from_str::<Value>(line) else {
+        return None; // ignore a malformed line rather than crash the server
+    };
+    let id = req.get("id").cloned();
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+    match method {
+        "initialize" => Some(ok(
+            id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "mdtask", "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )),
+        "tools/list" => Some(ok(id, json!({ "tools": tools_list() }))),
+        // Answered while tasks run, which is the point of the whole arrangement:
+        // a client's health check must not depend on how long a task takes.
+        "ping" => Some(ok(id, json!({}))),
+        "notifications/cancelled" => {
+            let target = req
+                .get("params")
+                .and_then(|p| p.get("requestId"))
+                .map(key)
+                .and_then(|k| inflight.remove(&k));
+            // Best effort by design: an id that already finished, or was never
+            // ours, is not an error. A notification gets no reply either way.
+            if let Some(cancel) = target {
+                cancel.cancel();
+            }
+            None
+        }
+        "tools/call" => {
+            let params = req.get("params");
+            let tool = params
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Only running a task can take real time. Listing is a read of
+            // already-parsed state, and going through a thread for it would add
+            // a round trip to hide nothing.
+            if tool != "run_task" {
+                return Some(ok(id, handle_call(files, params)));
+            }
+            let Some(id) = id else {
+                return None; // a call with no id has nowhere to send a result
+            };
+            let arguments = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let cancel = Cancel::new();
+            inflight.insert(key(&id), cancel.clone());
+
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let result = run_task(files, &arguments, &cancel);
+                // The loop may already be gone; nothing to do about it here.
+                let _ = tx.send(Event::Done { id, result });
+            });
+            None
+        }
+        // A notification (no id, e.g. notifications/initialized) gets no reply;
+        // an unknown request does.
+        _ => id.map(|id| {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}})
+        }),
+    }
 }
 
 fn ok(id: Option<Value>, result: Value) -> Value {
@@ -111,9 +234,16 @@ fn handle_call(files: &[(PathBuf, TaskFile)], params: Option<&Value>) -> Value {
         .and_then(|p| p.get("arguments"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let _ = &arguments;
     match tool {
         "list_tasks" => text_result(list_tasks_text(files), false),
-        "run_task" => run_task(files, &arguments),
+        // `run_task` is routed by the loop, not here: it needs a cancel handle
+        // and a thread of its own. Reaching it through this path would mean
+        // running it on the loop thread, which is the bug this all replaced.
+        "run_task" => text_result(
+            "run_task is dispatched by the server loop".to_string(),
+            true,
+        ),
         other => text_result(format!("unknown tool {other:?}"), true),
     }
 }
@@ -149,7 +279,7 @@ fn list_tasks_text(files: &[(PathBuf, TaskFile)]) -> String {
 /// Run an agent-allowed task and return its captured output. The allowlist, the
 /// within-file dependency resolution, and the injection guard are all enforced by
 /// `mdtask_core::run_agent`; this only shapes the arguments and the tool result.
-fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
+fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value, cancel: &Cancel) -> Value {
     let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
     if name.is_empty() {
         return text_result("run_task requires a `name`".to_string(), true);
@@ -164,7 +294,7 @@ fn run_task(files: &[(PathBuf, TaskFile)], arguments: &Value) -> Value {
         })
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match mdtask_core::run_agent(files, name, &positional, &cwd) {
+    match mdtask_core::run_agent_cancellable(files, name, &positional, &cwd, cancel) {
         Ok(out) => {
             let mut text = String::new();
             text.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -227,7 +357,7 @@ mod tests {
                 "## deploy\n\nAgent: allow\nRequires: build\n\n```sh\necho real-deploy\n```\n\n## build\n\n```sh\necho real-build\n```\n",
             ),
         ]);
-        let res = run_task(&f, &json!({ "name": "deploy" }));
+        let res = run_task(&f, &json!({ "name": "deploy" }), &Cancel::new());
         let text = call_text(&res);
         assert!(text.contains("real-build"), "got: {text}");
         assert!(text.contains("real-deploy"), "got: {text}");
@@ -243,7 +373,11 @@ mod tests {
             "tasks.md",
             "## greet\n\nAgent: allow\nArgs: name\n\n```sh\necho hi {{ name }}\n```\n",
         )]);
-        let res = run_task(&f, &json!({ "name": "greet", "args": ["x; echo PWNED"] }));
+        let res = run_task(
+            &f,
+            &json!({ "name": "greet", "args": ["x; echo PWNED"] }),
+            &Cancel::new(),
+        );
         let text = call_text(&res);
         assert_eq!(res["isError"], json!(true), "should be refused: {text}");
         assert!(text.contains("Refused"), "got: {text}");
