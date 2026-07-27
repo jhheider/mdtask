@@ -119,9 +119,9 @@ overlap as a convenience, not a contract.
     A bare name runs on its own defaults, as before. Inside the parentheses the
     first word is the task and the rest are its positional arguments, separated
     by whitespace or commas; quote one to include either. `{{ name }}` resolves
-    against **the invocation's** arguments — the values bound to the task named
-    on the command line — so `mdtask release bonus-die` means `bonus-die`
-    throughout the chain, however deep. One scope for the whole chain, rather
+    against **the invocation's** arguments, meaning the values bound to the task
+    named on the command line. So `mdtask release bonus-die` means `bonus-die`
+    throughout the chain, however deep: one scope for the whole chain, rather
     than each job resolving against its own caller.
 
     Unlike `{{ }}` in a script body, this is not a shell injection risk: the
