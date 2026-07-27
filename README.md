@@ -5,7 +5,7 @@ tasks in the same markdown you already write, whether a `tasks.md`, a
 `maskfile.md`, or a project `README.md`, and run them from a library, a CLI, or
 an agent-safe MCP surface.
 
-```markdown
+````markdown
 # Tasks
 
 Env: PKGX_DISABLE_UPDATE=1        # hoisted to every task
@@ -29,12 +29,13 @@ Opts: inherit-cwd
 ```sh
 pandoc -t pdf -o "${file%md}pdf" "$file"
 ```
-```
+````
 
 ```console
-$ mdtask                 # list tasks (walks up the tree; see below)
+$ mdtask                 # list tasks (see "Finding task files" below)
 $ mdtask build           # run one
 $ mdtask pdf notes/a.md  # positional args fill `Args:` in order
+$ mdtask --show build    # print what a task will run, without running it
 ```
 
 ## Why this exists (honestly)
@@ -68,7 +69,13 @@ overlap as a convenience, not a contract.
   `fish`, `python`, `ruby`, `node`, with an unlabeled fence running as `sh`).
 - **A heading with no script is a section**, not a task, so a `# Tasks` container
   is fine.
-- **Metadata** is `Key: value` lines in the task body (case-insensitive):
+- **Metadata** is `Key: value` lines in the task body (case-insensitive). A
+  metadata line must **begin a block**: it follows the heading, a blank line, a
+  fence, a list item, or another metadata line. Inside a paragraph it is prose,
+  and warns. Wrapping a sentence so a line of it happened to read as a key would
+  otherwise let a paragraph configure its own task, including opening the
+  `Agent:` gate, while reading as ordinary prose to every human. Description
+  before metadata, the way task files are already written, is unaffected.
   - `Args:` declares positional arguments in just's syntax. A bare `name` is
     **required**, `name='default'` is **optional** (that value when omitted), and
     a trailing `*name` is **variadic** (it collects the rest, space-joined). They
@@ -86,16 +93,49 @@ overlap as a convenience, not a contract.
       instead of the default. Use it for a carry-around task that operates on a
       path relative to where you are (this is just's `[no-cd]`).
     - **`no-strict`**: turn off the shell strictness described below.
-  - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). An `Env:` under a section
+
+    Before the first task heading, `Opts:` sets **file-level** options instead,
+    which are a separate vocabulary:
+
+    - **`include-parent`**: keep walking up and layer the parent's tasks under
+      this file's own. See [Finding task files](#finding-task-files).
+
+    Using one where the other belongs warns and says which way round it goes.
+  - `Env:` adds environment (`KEY=VALUE, KEY2=VALUE2`). Quote a value to put a
+    comma in it (`FLAGS="-a,-b"`); a fragment that cannot be a pair is reported
+    as a warning rather than dropped. An `Env:` under a section
     heading is **hoisted** to every task, regardless of position.
-  - `Requires:` lists task dependencies. The CLI runs them first, resolved across
-    the layered files, dependencies before dependents, each once (a diamond runs
-    its shared dependency once), aborting on the first failure. A missing or
-    cyclic dependency is a hard error. Dependencies run with no positional args
-    (their defaults fill in); only the named target receives the CLI args. Note
-    that dependencies **re-run on every invocation**: there is no `make`-style
-    "already satisfied" mtime or hash check, so `Requires:` is for ordering, not
-    for skipping work that is already done.
+  - `Requires:` lists task dependencies, comma-separated. The CLI runs them
+    first, resolved across the layered files, dependencies before dependents,
+    each once (a diamond runs its shared dependency once), aborting on the first
+    failure. A missing or cyclic dependency is a hard error.
+
+    A dependency may take **arguments**, in parentheses, which is just's syntax:
+
+    ```markdown
+    Requires: lint, (dist {{ module }}), (deploy "the droplet" now)
+    ```
+
+    A bare name runs on its own defaults, as before. Inside the parentheses the
+    first word is the task and the rest are its positional arguments, separated
+    by whitespace or commas; quote one to include either. `{{ name }}` resolves
+    against **the invocation's** arguments, meaning the values bound to the task
+    named on the command line. So `mdtask release bonus-die` means `bonus-die`
+    throughout the chain, however deep: one scope for the whole chain, rather
+    than each job resolving against its own caller.
+
+    Unlike `{{ }}` in a script body, this is not a shell injection risk: the
+    value becomes one element of an argument list, never text spliced into
+    source. A placeholder naming nothing is left as written.
+
+    Deduplication keys on the task **and its resolved arguments**, so
+    `(dist api)` and `(dist web)` both run, while two paths reaching
+    `(dist api)` still run it once. Cycle detection keys on the name alone, so
+    a task requiring itself is an error however the arguments differ.
+
+    Note that dependencies **re-run on every invocation**: there is no
+    `make`-style "already satisfied" mtime or hash check, so `Requires:` is for
+    ordering, not for skipping work that is already done.
   - `Agent: allow` opts a task in to an MCP or agent surface. It is **off by
     default**. `run` and `run_captured` ignore it; the gate is `run_agent` (which
     refuses anything not allowed) and `agent_jobs` (which lists only the allowed
@@ -134,9 +174,32 @@ cargo test                    # passes
                               # ...and the task reports success
 ```
 
-`just` avoids this by running each line as its own recipe line and stopping at
-the first error. mdtask hands the block to a shell, so it asks the shell for the
-same behavior.
+`just` avoids this in its *default* mode by running each line as its own recipe
+line and stopping at the first error. Its shebang recipes, like xc and a
+multi-line Taskfile `cmd:`, run the whole body as one script and do **not** add
+strictness: there, writing `set -euo pipefail` yourself is the author's job.
+mdtask hands the block to a shell too, so it asks the shell for that behavior on
+your behalf instead.
+
+Which language counts as a shell is decided by the fence tag. `sh`, `shell`,
+`bash`, `zsh` and an untagged fence all get a prelude. `fish` does not: it has
+neither `set -e` nor `set -o pipefail`, so a multi-step fish task exits with the
+status of its **last** command and you must check `$status` yourself. Neither do
+`python`, `ruby` or `node`, which raise on error already.
+
+A tag mdtask does not recognize (`console`, `shell-session`, `bash5`) falls back
+to `sh` **with** the prelude, and the parse warns you it did. The fallback is
+deliberate, since those tags are usually a shell anyway, but it is a guess:
+a fence that is not a shell script at all will fail on its first line rather
+than be skipped. If mdtask is reading a `README.md`, that is the behavior to
+expect from your ```toml and ```json examples, and the reason to keep tasks in a
+`tasks.md` once a project has more than a couple.
+
+> Getting this wrong is how the guarantee above became untrue for a while: the
+> fallback resolved to `sh` while its prelude resolved to *nothing*, so a
+> ```console block ran unstrict and a failing step exited 0. One table now
+> answers both questions, and a test asserts that anything running a shell
+> carries failure detection.
 
 Deliberately **not** `set -u`. Catching an unset variable is a lint rather than
 failure detection, and it changes the meaning of correct scripts: reading an
@@ -144,21 +207,76 @@ optional variable is ordinary in a task file. Write it yourself if you want it.
 `pipefail` is skipped for plain `sh`, because it is not POSIX and dash rejects
 it. Non-shell tasks (`python`, `node`, `ruby`) get nothing injected.
 
+### Completions
+
+```sh
+mdtask --completions zsh  > "${fpath[1]}/_mdtask"
+mdtask --completions bash > /usr/local/etc/bash_completion.d/mdtask
+mdtask --completions fish > ~/.config/fish/completions/mdtask.fish
+```
+
+The scripts ask `mdtask` for the task list at completion time rather than baking
+names in, since the tasks are whatever the markdown in the current directory
+says. zsh and fish show each task's description beside its name.
+
 ### Finding task files
 
-The CLI walks **up** from the current directory (like `make`, `just`, and `xc`),
-taking the first `tasks.md`, `maskfile.md`, or `README.md` in each ancestor that
-defines a task. Nearer files **shadow** farther ones by task name, like just's
-`set fallback`, so a project inherits a baseline of tasks from its parents and
-overrides them where it wants. (`mdtask-core::parse` itself does no filesystem
-access; an embedder with its own project root just calls it directly.)
+The CLI looks for `tasks.md`, `maskfile.md`, or `README.md` in the current
+directory, taking the first one that defines a task, and **stops there**.
+
+A file can ask to inherit from above with a file-level option, before its first
+task heading:
+
+```markdown
+# my project
+
+Opts: include-parent
+
+## build
+...
+```
+
+Then the walk continues up (like `make`, `just`, and `xc`), and nearer files
+**shadow** farther ones by task name, like just's `set fallback`, so a project
+inherits a baseline of tasks from its parents and overrides them where it wants.
+Each file up the chain decides for itself, so the chain continues only as far as
+every link agrees.
+
+Inheritance is opt-in because it used to be unconditional and run to the
+filesystem root. Every file the walk passed could define **or shadow** a task
+name, so `mdtask build` in a freshly cloned repository could run a script from a
+directory above it, chosen by a file the caller never looked at. Stopping at the
+first file means what runs is what is written in the file you can see from where
+you are standing. (Changed in 0.5; before that, every ancestor was layered in
+automatically.)
+
+(`mdtask-core::parse` itself does no filesystem access; an embedder with its own
+project root just calls it directly.)
 
 ### MCP
 
-Built with `--features mcp`, `mdtask mcp` serves the working set to an MCP client
+Built with `--features mcp`, `mdtask --mcp` serves the working set to an MCP client
 (Claude Desktop or Code) over stdio, so an agent can run your tasks. It is **fail
 closed**: only tasks marked `Agent: allow` are exposed, everything else is
 invisible and unrunnable.
+
+`mdtask mcp` does the same, but yields to a task actually named `mcp`. A task
+file is the authority on what its own task names mean, so a reserved word does
+not get to shadow one silently. Use `--mcp` when you want the server regardless.
+
+The server stays responsive while a task runs: `ping` is answered, and a second
+`run_task` runs alongside the first rather than queueing behind it.
+`notifications/cancelled` is honoured, and the task is stopped rather than merely
+abandoned. Each task runs in its own process group and cancelling signals the
+group (`SIGTERM`, then `SIGKILL` after a two second grace), so a script's
+children go down with it instead of being orphaned while the client is told the
+task stopped. Closing stdin cancels everything still running, since the client
+is gone.
+
+The library side of that is `run_agent_cancellable` and the `Cancel` handle; it
+is also the reason `mdtask-core` has a `libc` dependency on unix. std can put a
+child into its own process group but cannot signal one, and signalling only the
+shell we spawned would leave the actual work running.
 
 - `list_tasks` enumerates **only** the allowed tasks (`agent_jobs`), so the rest
   are not even discoverable.
@@ -216,9 +334,15 @@ allow gate and the injection guard.
 
 ## Status
 
-Early. The core parser and runner are solid and tested; the CLI runs tasks and
-serves MCP; a crates.io release is still pending. Intended consumers:
-[gloaming](https://github.com/jhheider/gloaming) and penknife.
+Published on crates.io: [`mdtask`](https://crates.io/crates/mdtask) (the CLI) and
+[`mdtask-core`](https://crates.io/crates/mdtask-core) (the library). The parser
+and runner are tested and in use; the CLI runs tasks and serves MCP.
+
+0.5 tightened several defaults after a security and usability audit, and one of
+them is breaking: inheriting tasks from a parent directory is now opt-in. See
+[Finding task files](#finding-task-files).
+
+Consumers: [gloaming](https://github.com/jhheider/gloaming) and penknife.
 
 ## Credits
 

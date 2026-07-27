@@ -47,7 +47,14 @@ fn every_feature_parses_and_combines() {
 
     // deploy: a dependency and the agent gate, both public metadata.
     let deploy = tf.job("deploy").unwrap();
-    assert_eq!(deploy.requires, ["build"]);
+    assert_eq!(
+        deploy
+            .requires
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build"]
+    );
     assert!(deploy.agent_allow);
 
     // Only `deploy` is exposed to an agent surface.

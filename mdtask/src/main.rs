@@ -27,7 +27,7 @@
 //! spawn) live in `mdtask-core`; this binary just resolves files and calls
 //! `mdtask_core::run`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mdtask_core::{Job, RunError, TaskFile};
@@ -42,8 +42,11 @@ mdtask runs tasks defined in markdown (tasks.md / maskfile.md / README.md).
 Usage:
   mdtask                    list the available tasks
   mdtask <name> [args...]   run a task; positional args fill its `Args:` in order
-  mdtask mcp                serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask --mcp              serve agent-allowed tasks to an MCP client (needs `mcp`)
+  mdtask mcp                the same, unless a task is named `mcp`, which wins
+  mdtask -s, --show NAME    print a task's script and metadata without running it
   mdtask -f, --file FILE    use a specific task file (no directory walk)
+  mdtask --completions SH   print a completion script (bash, zsh, fish)
   mdtask -V, --version      print the version
   mdtask -h, --help         print this help
 ";
@@ -62,18 +65,54 @@ fn main() -> ExitCode {
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
+        // Emitted rather than checked in, and before the task files are even
+        // looked for: printing a completion script must work anywhere.
+        Some("--completions") => {
+            let Some(shell) = args.get(1) else {
+                eprintln!("mdtask: --completions needs a shell (bash, zsh, fish)");
+                return ExitCode::FAILURE;
+            };
+            return completions(shell);
+        }
         _ => {}
     }
 
     // -f/--file FILE selects one task file (no walk); else walk up from cwd.
+    //
+    // Only in the leading position, like -h and -V above. Scanning all of argv
+    // meant a task's own arguments were stolen: `mdtask run -f config.yml` tried
+    // to read `config.yml` as a task file, and any task taking a `-f` flag of its
+    // own (`grep -f`, `docker -f`, `rsync -f`) was unusable with no way to
+    // escape. Everything after the task name belongs to the task, which is what
+    // this module's own docs promise.
     let mut file: Option<PathBuf> = None;
-    if let Some(i) = args.iter().position(|a| a == "-f" || a == "--file") {
-        if i + 1 >= args.len() {
-            eprintln!("mdtask: {} needs a path", args[i]);
+    if matches!(args.first().map(String::as_str), Some("-f" | "--file")) {
+        if args.len() < 2 {
+            eprintln!("mdtask: {} needs a path", args[0]);
             return ExitCode::FAILURE;
         }
-        file = Some(PathBuf::from(args.remove(i + 1)));
-        args.remove(i);
+        file = Some(PathBuf::from(args.remove(1)));
+        args.remove(0);
+    }
+
+    // --mcp always serves, whatever the task file contains. The bare `mcp`
+    // subcommand below is the older spelling and yields to a task of that name.
+    let serve_mcp = matches!(args.first().map(String::as_str), Some("--mcp"));
+    if serve_mcp {
+        args.remove(0);
+    }
+
+    // --show NAME: print the task instead of running it. After -f, so
+    // `mdtask -f other.md --show build` works, and leading-position-only like
+    // every other flag, so a task's own `--show` still reaches the task.
+    let mut show_name: Option<String> = None;
+    if matches!(args.first().map(String::as_str), Some("-s" | "--show")) {
+        if args.len() < 2 {
+            eprintln!("mdtask: {} needs a task name", args[0]);
+            return ExitCode::FAILURE;
+        }
+        show_name = Some(args.remove(1));
+        args.remove(0);
     }
 
     // Discover the layered task files, nearest first.
@@ -101,17 +140,48 @@ fn main() -> ExitCode {
         }
     }
 
+    if serve_mcp {
+        return run_mcp(&files);
+    }
+
+    if let Some(name) = show_name {
+        return show(&files, &name);
+    }
+
     let Some(name) = args.first().cloned() else {
         return list(&files);
     };
 
-    // The `mcp` subcommand serves the agent-allowed tasks over stdio; it is checked
-    // before task dispatch.
-    if name == "mcp" {
+    // The `mcp` subcommand serves the agent-allowed tasks over stdio, but only
+    // when the task file does not define a task by that name. A task file is the
+    // authority on what its task names mean, and a reserved word that silently
+    // shadows one is a name you cannot use and are never told about. `--mcp`
+    // above is the unambiguous spelling.
+    if name == "mcp" && job_named(&files, "mcp").is_none() {
         return run_mcp(&files);
     }
 
     let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+
+    // Surplus positionals are a typo, not an offering. They used to be dropped
+    // in silence, so a stale flag or a second task name after the first ran the
+    // task anyway and exited 0. Checked here rather than in core: the library
+    // binding is a mechanism, and an embedder passing a vector is doing so
+    // deliberately, but a person typing extra words at a shell is not.
+    if let Some(job) = job_named(&files, &name) {
+        let declared = job.args.len();
+        let takes_rest = job.args.last().is_some_and(|a| a.variadic);
+        if !takes_rest && positional.len() > declared {
+            eprintln!(
+                "mdtask: {} unexpected argument(s) [{}] (usage: {})",
+                positional.len() - declared,
+                positional[declared..].join(", "),
+                invocation_usage(&name, job)
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Core owns the whole run: resolve the target and its `Requires:` chain across
@@ -139,10 +209,23 @@ fn report(files: &[(PathBuf, TaskFile)], name: &str, e: &RunError) {
     match e {
         RunError::NotFound(n) => eprintln!("mdtask: no task named {n:?}"),
         RunError::MissingArg(_) => match job_named(files, name) {
-            Some(job) => eprintln!("mdtask: {e} (usage: mdtask {name} {})", usage(job)),
+            Some(job) => eprintln!("mdtask: {e} (usage: {})", invocation_usage(name, job)),
             None => eprintln!("mdtask: {e}"),
         },
         _ => eprintln!("mdtask: {e}"),
+    }
+}
+
+/// How to invoke a job: `mdtask <name>` plus its declared arguments, with no
+/// trailing space when it declares none. The old form always appended a space
+/// and the argument list, so a task with no arguments advertised itself as
+/// `mdtask release ` with nothing after it.
+fn invocation_usage(name: &str, job: &Job) -> String {
+    let args = usage(job);
+    if args.is_empty() {
+        format!("mdtask {name}")
+    } else {
+        format!("mdtask {name} {args}")
     }
 }
 
@@ -165,25 +248,154 @@ fn run_mcp(_files: &[(PathBuf, TaskFile)]) -> ExitCode {
 
 /// List tasks across the layered files, nearest first, each name once (a nearer
 /// definition shadows a farther one).
+///
+/// Two shapes, because a listing has two audiences. On a terminal it is a padded
+/// column with the description wrapped under it, grouped by source file when
+/// more than one contributes: which file a task came from is the first thing you
+/// need when a name resolves to something you did not expect. Piped, it stays
+/// one tab-separated line per task, so it is still greppable.
+///
+/// Neither shape truncates. The description used to be cut at its first physical
+/// line, which in a hard-wrapped markdown paragraph is not a sentence, or even a
+/// clause: listings ended mid-phrase on "One license only permits one".
 fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
-    let mut any = false;
-    for (_, tf) in files {
+    let mut groups: Vec<(&Path, Vec<(String, String)>)> = Vec::new();
+    for (path, tf) in files {
+        let mut rows = Vec::new();
         for job in tf.jobs() {
             if seen.insert(job.name.clone()) {
-                let a = usage(job);
-                let sep = if a.is_empty() { "" } else { " " };
-                let desc = job.description.lines().next().unwrap_or("");
-                println!("{}{sep}{a}\t{desc}", job.name);
-                any = true;
+                let args = usage(job);
+                let sep = if args.is_empty() { "" } else { " " };
+                rows.push((
+                    format!("{}{sep}{args}", job.name),
+                    summary(&job.description),
+                ));
+            }
+        }
+        if !rows.is_empty() {
+            groups.push((path.as_path(), rows));
+        }
+    }
+
+    if groups.is_empty() {
+        eprintln!("mdtask: no tasks found");
+        return ExitCode::FAILURE;
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        for (_, rows) in &groups {
+            for (label, desc) in rows {
+                println!("{label}\t{desc}");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let width = terminal_width();
+    // Wide enough for the labels, but never so wide that the description is
+    // squeezed into a gutter by one long task name.
+    let longest = groups
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(l, _)| l.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let column = longest.min(width / 3).max(1) + 2;
+    let show_source = groups.len() > 1;
+
+    for (i, (path, rows)) in groups.iter().enumerate() {
+        if show_source {
+            if i > 0 {
+                println!();
+            }
+            println!("{}", display_path(path));
+        }
+        for (label, desc) in rows {
+            let indent = if show_source { 2 } else { 0 };
+            let pad = " ".repeat(indent);
+            if desc.is_empty() {
+                println!("{pad}{label}");
+                continue;
+            }
+            // A label longer than the column gets the description on the next
+            // line rather than shoving the whole row out of alignment.
+            let lines = wrap(desc, width.saturating_sub(column + indent).max(20));
+            let mut lines = lines.iter();
+            if label.chars().count() < column {
+                let gap = column - label.chars().count();
+                println!("{pad}{label}{}{}", " ".repeat(gap), lines.next().unwrap());
+            } else {
+                println!("{pad}{label}");
+            }
+            for rest in lines {
+                println!("{pad}{}{rest}", " ".repeat(column));
             }
         }
     }
-    if any {
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("mdtask: no tasks found");
-        ExitCode::FAILURE
+    ExitCode::SUCCESS
+}
+
+/// A task's description as one line: its first paragraph, unwrapped.
+///
+/// Markdown descriptions are hard-wrapped prose, so the first *line* is an
+/// arbitrary fragment. The first *paragraph* is the author's opening thought,
+/// which is what a listing wants.
+fn summary(description: &str) -> String {
+    description
+        .lines()
+        .take_while(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Greedy word wrap. Counts characters, not display columns: mdtask has no
+/// dependencies and a task description is overwhelmingly ASCII, so a wide
+/// character wraps a column early rather than pulling in a unicode-width crate.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Terminal width from `COLUMNS`, else 80.
+///
+/// The ioctl would need libc, and this binary's whole dependency list is
+/// `serde_json`, behind an off-by-default feature. Eighty is right when the
+/// variable is absent and a shell that exports it gets the real thing.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 40)
+        .unwrap_or(80)
+}
+
+/// A task file's path, relative to the current directory when that is shorter.
+fn display_path(path: &Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let rel = cwd
+        .as_ref()
+        .and_then(|c| path.strip_prefix(c).ok())
+        .map(|p| p.display().to_string());
+    match rel {
+        Some(r) if !r.is_empty() => r,
+        _ => path.display().to_string(),
     }
 }
 
@@ -203,4 +415,272 @@ fn usage(job: &Job) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Print everything about a task without running it: where it is defined, what
+/// it declares, and the script itself.
+///
+/// A task runner runs shell that someone else wrote, quite possibly in a file
+/// you have not opened, and until now the only way to find out what `mdtask
+/// deploy` would do was to run `mdtask deploy`. That is a poor trade to offer.
+fn show(files: &[(PathBuf, TaskFile)], name: &str) -> ExitCode {
+    let Some((path, job)) = files
+        .iter()
+        .find_map(|(p, tf)| tf.job(name).map(|j| (p, j)))
+    else {
+        eprintln!("mdtask: no task named {name:?}");
+        return ExitCode::FAILURE;
+    };
+
+    println!("{}", invocation_usage(name, job));
+    println!("  from  {}", display_path(path));
+
+    let lang = if job.lang().is_empty() {
+        "(unlabeled fence, runs as sh)".to_string()
+    } else {
+        job.lang().to_string()
+    };
+    println!("  runs  {lang}");
+
+    if !job.opts().is_empty() {
+        println!("  opts  {}", job.opts().join(" "));
+    }
+    for (k, v) in job.env() {
+        println!("  env   {k}={v}");
+    }
+    if !job.requires.is_empty() {
+        // These run first, in order, and each may pull in dependencies of its
+        // own; what is printed is what this task declares, not the flattened
+        // chain.
+        let deps: Vec<String> = job
+            .requires
+            .iter()
+            .map(|r| {
+                if r.args.is_empty() {
+                    r.name.clone()
+                } else {
+                    format!("{} {}", r.name, r.args.join(" "))
+                }
+            })
+            .collect();
+        println!("  first {}", deps.join(", "));
+    }
+    if job.agent_allow {
+        println!("  agent allowed (an MCP or agent surface may run this)");
+    }
+
+    let desc = job.description.trim();
+    if !desc.is_empty() {
+        println!();
+        for line in desc.lines() {
+            println!("{}", indent("  ", line));
+        }
+    }
+
+    println!();
+    for line in job.script().lines() {
+        println!("{}", indent("    ", line));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Indent a line, leaving a blank one blank rather than turning it into
+/// trailing whitespace.
+fn indent(pad: &str, line: &str) -> String {
+    if line.is_empty() {
+        String::new()
+    } else {
+        format!("{pad}{line}")
+    }
+}
+
+/// Completion scripts, emitted by the binary rather than checked in.
+///
+/// They ask `mdtask` for the task list at completion time rather than baking
+/// names in, which is the only thing that works here: the tasks are whatever the
+/// markdown in the current directory says they are, and they change without the
+/// completion script changing. That is why the piped listing is one
+/// tab-separated line per task with the description after the tab; these scripts
+/// are its consumer, so that format is load-bearing.
+fn completions(shell: &str) -> ExitCode {
+    let script = match shell {
+        "bash" => BASH_COMPLETIONS,
+        "zsh" => ZSH_COMPLETIONS,
+        "fish" => FISH_COMPLETIONS,
+        other => {
+            eprintln!("mdtask: no completions for {other:?} (bash, zsh, fish)");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{script}");
+    ExitCode::SUCCESS
+}
+
+/// `mdtask --completions bash > /etc/bash_completion.d/mdtask`
+const BASH_COMPLETIONS: &str = r#"# mdtask completions for bash.
+# Install: mdtask --completions bash > /usr/local/etc/bash_completion.d/mdtask
+_mdtask() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Flags taking a path, and one taking a task name.
+    case "$prev" in
+        -f|--file) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        -s|--show) COMPREPLY=($(compgen -W "$(_mdtask_names)" -- "$cur")); return ;;
+    esac
+
+    # Only the first word is a task name; everything after it is the task's own,
+    # and mdtask cannot know what those mean.
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$(_mdtask_names) --show --file --mcp --help --version" -- "$cur"))
+    fi
+}
+
+# The task list comes from mdtask itself: tasks are whatever the markdown in this
+# directory says, so nothing can be baked in. stdout is a pipe here, so the
+# listing is one tab-separated line per task.
+_mdtask_names() {
+    mdtask 2>/dev/null | cut -f1 | cut -d' ' -f1
+}
+
+complete -F _mdtask mdtask
+"#;
+
+/// `mdtask --completions zsh > "${fpath[1]}/_mdtask"`
+const ZSH_COMPLETIONS: &str = r#"#compdef mdtask
+# mdtask completions for zsh.
+# Install: mdtask --completions zsh > "${fpath[1]}/_mdtask"
+
+_mdtask() {
+    local -a tasks
+    local line name desc
+
+    # Ask mdtask for the tasks: they are whatever the markdown here says, so
+    # nothing can be baked in. Piped, the listing is `name<TAB>description`, and
+    # zsh shows the description beside each candidate.
+    mdtask 2>/dev/null | while IFS=$'\t' read -r name desc; do
+        # Strip the argument usage, leaving the bare task name.
+        tasks+=("${name%% *}:${desc}")
+    done
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[print help]' \
+        '(-V --version)'{-V,--version}'[print the version]' \
+        '(-f --file)'{-f,--file}'[use a specific task file]:file:_files' \
+        '(-s --show)'{-s,--show}'[print a task without running it]:task:->task' \
+        '--mcp[serve agent-allowed tasks over MCP]' \
+        '1:task:->task' \
+        '*::arguments:_default'
+
+    # Only the first word is a task name; the rest belong to the task itself.
+    case "$state" in
+        task) _describe -t tasks 'task' tasks ;;
+    esac
+}
+
+_mdtask "$@"
+"#;
+
+/// `mdtask --completions fish > ~/.config/fish/completions/mdtask.fish`
+const FISH_COMPLETIONS: &str = r#"# mdtask completions for fish.
+# Install: mdtask --completions fish > ~/.config/fish/completions/mdtask.fish
+
+# The task list comes from mdtask itself, since tasks are whatever the markdown
+# in this directory says. Piped, the listing is `name<TAB>description`, which is
+# already the format fish wants for a candidate with a description.
+function __mdtask_tasks
+    mdtask 2>/dev/null | string replace -r '^(\S+)[^\t]*\t?' '$1\t'
+end
+
+# Only the first word is a task name; the rest belong to the task.
+complete -c mdtask -f -n __fish_is_first_arg -a '(__mdtask_tasks)'
+complete -c mdtask -f -n __fish_is_first_arg -s h -l help -d 'print help'
+complete -c mdtask -f -n __fish_is_first_arg -s V -l version -d 'print the version'
+complete -c mdtask -F -n __fish_is_first_arg -s f -l file -d 'use a specific task file'
+complete -c mdtask -f -n __fish_is_first_arg -s s -l show -d 'print a task without running it' -a '(__mdtask_tasks)'
+complete -c mdtask -f -n __fish_is_first_arg -l mcp -d 'serve agent-allowed tasks over MCP'
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this replaced: a listing showed the first *physical* line of a
+    /// hard-wrapped markdown paragraph, which ends wherever the author's editor
+    /// happened to wrap. Real output read "One license only permits one".
+    /// Each script must actually ask `mdtask` for the task list rather than
+    /// baking names in. Tasks are whatever the markdown in the current directory
+    /// says they are, so a script with a fixed list is wrong the moment someone
+    /// adds a task, and wrong in a different directory immediately.
+    #[test]
+    fn every_completion_script_queries_mdtask_at_completion_time() {
+        for script in [BASH_COMPLETIONS, ZSH_COMPLETIONS, FISH_COMPLETIONS] {
+            assert!(script.contains("mdtask 2>/dev/null"), "{script}");
+        }
+    }
+
+    /// The piped listing is `name<TAB>description`, and these scripts are its
+    /// consumer, so the tab is load-bearing. Verified against real bash, zsh,
+    /// and fish; this guards the shape they parse.
+    #[test]
+    fn the_shells_that_show_descriptions_split_on_the_tab() {
+        assert!(ZSH_COMPLETIONS.contains("IFS=$'\\t'"), "{ZSH_COMPLETIONS}");
+        assert!(FISH_COMPLETIONS.contains("\\t"), "{FISH_COMPLETIONS}");
+    }
+
+    #[test]
+    fn indent_leaves_a_blank_line_blank() {
+        assert_eq!(indent("    ", "echo hi"), "    echo hi");
+        assert_eq!(indent("    ", ""), "", "not four spaces of nothing");
+    }
+
+    #[test]
+    fn summary_unwraps_the_first_paragraph() {
+        let desc = "Start the local dev server. One license only permits one\n\
+                    instance at a time.\n\
+                    \n\
+                    A second paragraph, which the listing does not want.\n";
+        assert_eq!(
+            summary(desc),
+            "Start the local dev server. One license only permits one instance at a time."
+        );
+    }
+
+    #[test]
+    fn summary_of_nothing_is_nothing() {
+        assert_eq!(summary(""), "");
+        assert_eq!(summary("\n\n"), "");
+    }
+
+    #[test]
+    fn wrap_breaks_on_words_and_fills() {
+        assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
+    }
+
+    /// A URL or a long path has no break in it. Overflowing the column is the
+    /// right failure: the alternative is severing something meant to be copied.
+    #[test]
+    fn wrap_does_not_break_inside_a_word() {
+        let long = "https://example.com/a/very/long/path/indeed";
+        assert_eq!(wrap(long, 10), [long]);
+    }
+
+    #[test]
+    fn wrap_always_returns_at_least_one_line() {
+        assert_eq!(wrap("", 10), [""]);
+    }
+
+    #[test]
+    fn terminal_width_falls_back_when_columns_is_unusable() {
+        // Not a number, absurdly narrow, or absent: 80 either way. A width of 3
+        // would put one word per line under a column that does not fit.
+        for bad in ["", "wide", "0", "12"] {
+            unsafe { std::env::set_var("COLUMNS", bad) };
+            assert_eq!(terminal_width(), 80, "COLUMNS={bad:?}");
+        }
+        unsafe { std::env::set_var("COLUMNS", "120") };
+        assert_eq!(terminal_width(), 120);
+        unsafe { std::env::remove_var("COLUMNS") };
+    }
 }

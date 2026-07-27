@@ -1,6 +1,6 @@
 [package]
 name = "mdtask-core"
-version = "0.4.0"
+version = "0.5.0"
 description = "Embeddable, execution-capable Rust task runner whose tasks are defined in markdown (heading = task, fenced block = script, Key: value metadata)."
 keywords = ["task", "runner", "markdown", "make", "just"]
 categories = ["development-tools", "parser-implementations"]
@@ -10,5 +10,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Only for killpg: cancelling a task has to signal the process group, or the
+# shell dies and its children keep running while we report the task stopped.
+# std can put a child in its own group but cannot signal one.
+libc = "0.2"
 
 [dependencies]
