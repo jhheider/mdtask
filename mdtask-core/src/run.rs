@@ -100,6 +100,21 @@ fn plan_invocations<'a>(
     let mut plan = Vec::with_capacity(resolved.len());
     for (name, step_args) in resolved {
         let (tf, job, dir) = lookup(name).expect("a resolved name still resolves");
+        // Checked for every step, not just the target: a chain is only as
+        // runnable as its dependencies, and finding out three steps in is worse
+        // than finding out before anything ran.
+        let invalid: Vec<String> = job
+            .args
+            .iter()
+            .filter(|a| !a.is_valid_name())
+            .map(|a| a.name.clone())
+            .collect();
+        if !invalid.is_empty() {
+            return Err(RunError::InvalidArgName {
+                task: name.to_string(),
+                args: invalid,
+            });
+        }
         let values = TaskFile::bind(job, &step_args).map_err(RunError::MissingArg)?;
         let inv = tf
             .invocation(job, &values, cwd, dir)
@@ -795,6 +810,53 @@ true
         let bpos = text.find('B').expect("B in output");
         let apos = text.find('A').expect("A in output");
         assert!(bpos < apos, "deps must run first: {text}");
+    }
+
+    /// Refused before anything runs. Reaching the script means failing as
+    /// `slug: unbound variable`, which names the spelling that is correct and
+    /// says nothing about the declaration that is wrong.
+    #[test]
+    fn a_task_with_an_unusable_argument_name_is_refused_before_it_runs() {
+        let f = files(&[(
+            "tasks.md",
+            "## build\n\nArgs: slug, repo\n\n```sh\necho \"$slug\"\n```\n",
+        )]);
+        match run_captured(&f, "build", &["a".into(), "b".into()], Path::new(".")) {
+            Err(RunError::InvalidArgName { task, args }) => {
+                assert_eq!(task, "build");
+                assert_eq!(args, vec!["slug,".to_string()]);
+            }
+            other => panic!("expected InvalidArgName, got {other:?}"),
+        }
+    }
+
+    /// The message has to name the cause, not just the symptom. Someone reading
+    /// it should not have to open the parser to find out what a comma did.
+    #[test]
+    fn the_refusal_explains_the_comma() {
+        let e = RunError::InvalidArgName {
+            task: "build".into(),
+            args: vec!["slug,".into()],
+        };
+        let text = e.to_string();
+        assert!(text.contains("slug,"), "{text}");
+        assert!(text.contains("whitespace-separated"), "{text}");
+        assert!(text.contains("Args: a b"), "{text}");
+    }
+
+    /// A chain is only as runnable as its dependencies, so the check covers
+    /// every step. Finding out three steps in is worse than not starting.
+    #[test]
+    fn a_dependency_with_an_unusable_argument_name_is_refused_too() {
+        let f = files(&[(
+            "tasks.md",
+            "## a\n\nRequires: b\n\n```sh\ntrue\n```\n\n\
+             ## b\n\nArgs: x, y\n\n```sh\ntrue\n```\n",
+        )]);
+        match run_captured(&f, "a", &[], Path::new(".")) {
+            Err(RunError::InvalidArgName { task, .. }) => assert_eq!(task, "b"),
+            other => panic!("expected InvalidArgName for the dependency, got {other:?}"),
+        }
     }
 
     #[test]
