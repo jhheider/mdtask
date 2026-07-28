@@ -116,6 +116,22 @@ pub struct Arg {
     pub default: Option<String>,
 }
 
+impl Arg {
+    /// Whether this name can actually become the shell variable the script will
+    /// read.
+    ///
+    /// An argument is bound as an environment variable, so a name that is not a
+    /// valid identifier cannot ever work. Worth knowing at parse time rather
+    /// than at `unbound variable` time, because the shell reports the name the
+    /// script used, which is spelled correctly, and says nothing about the
+    /// declaration that is actually wrong.
+    pub fn is_valid_name(&self) -> bool {
+        let mut chars = self.name.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+}
+
 /// A runnable command built from a job: what to exec, with what environment, in
 /// which directory. Internal mechanics: the `run*` functions build it and spawn
 /// it, and no consumer ever sees the program, argv, or interpreter.
@@ -167,6 +183,11 @@ impl std::error::Error for DepError {}
 /// exit status rides back in the `Ok`). Only `Debug` is derived, because `Io`
 /// wraps a [`std::io::Error`], which is neither `Clone` nor `PartialEq`.
 #[derive(Debug)]
+/// Non-exhaustive on purpose. This release adds a variant, which is a breaking
+/// change only because it was not marked before; marking it now means the next
+/// error mdtask learns to report costs consumers a `_` arm they already have
+/// rather than a major bump.
+#[non_exhaustive]
 pub enum RunError {
     /// No job by that name across the resolved files (from [`run`]/[`run_captured`]).
     NotFound(String),
@@ -181,6 +202,13 @@ pub enum RunError {
     Injects { task: String, args: Vec<String> },
     /// A required positional argument had no value.
     MissingArg(MissingArg),
+    /// A job declares an argument whose name cannot be a shell variable, so the
+    /// script could never read it. `args` lists the offending names.
+    ///
+    /// Refused rather than run, because running it reaches the script and fails
+    /// there as `unbound variable` naming the *correct* spelling used in the
+    /// script, which points away from the declaration that is wrong.
+    InvalidArgName { task: String, args: Vec<String> },
     /// The `Requires:` chain could not be resolved (a typo or a cycle).
     Dependency(DepError),
     /// The run was stopped through a [`Cancel`](crate::Cancel) handle.
@@ -222,6 +250,14 @@ impl std::fmt::Display for RunError {
                 args.join(", ")
             ),
             RunError::Cancelled => write!(f, "cancelled"),
+            RunError::InvalidArgName { task, args } => write!(
+                f,
+                "task {task:?} declares argument(s) [{}] whose name(s) cannot be a shell \
+                 variable, so the script could never read them. `Args:` is whitespace-separated \
+                 (just's syntax), so a comma becomes part of the name: write `Args: a b`, not \
+                 `Args: a, b`. Refused.",
+                args.join(", ")
+            ),
             RunError::MissingArg(e) => e.fmt(f),
             RunError::Dependency(e) => e.fmt(f),
             RunError::Io {

@@ -452,7 +452,19 @@ fn apply_line(
             }
             "args" | "arguments" => {
                 if let Some(t) = job {
-                    t.args.extend(parse_args(value));
+                    let parsed = parse_args(value);
+                    // Caught here as well as refused at run time, so `mdtask`
+                    // with no arguments shows the problem before anyone tries
+                    // to run the task.
+                    for a in parsed.iter().filter(|a| !a.is_valid_name()) {
+                        warnings.push(format!(
+                            "task {:?}: argument name `{}` cannot be a shell variable. \
+                             `Args:` is whitespace-separated (just's syntax), so a comma \
+                             becomes part of the name: write `Args: a b`, not `Args: a, b`",
+                            t.name, a.name
+                        ));
+                    }
+                    t.args.extend(parsed);
                 }
                 return true;
             }
@@ -1067,5 +1079,74 @@ mod tests {
             "no-strict must be recognized: {:?}",
             tf.warnings()
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_arg_names {
+    use super::*;
+
+    fn file(args_line: &str) -> TaskFile {
+        parse(&format!(
+            "## build\n\nDo a thing.\n\nArgs: {args_line}\n\n```sh\necho \"$slug\"\n```\n"
+        ))
+    }
+
+    /// The slip this exists for. `Args:` follows just's syntax and splits on
+    /// whitespace, so the comma became part of the name and the task died in
+    /// bash as `slug: unbound variable`, naming the spelling that was correct.
+    #[test]
+    fn a_comma_separated_list_warns_and_says_why() {
+        let tf = file("slug, repo");
+        let warning = tf
+            .warnings()
+            .iter()
+            .find(|w| w.contains("slug,"))
+            .unwrap_or_else(|| panic!("no warning about `slug,` in {:?}", tf.warnings()));
+        assert!(warning.contains("whitespace-separated"), "{warning}");
+        assert!(warning.contains("Args: a b"), "{warning}");
+    }
+
+    /// Only the malformed one. The second name is fine and warning about it
+    /// would bury the one that matters.
+    #[test]
+    fn only_the_offending_name_is_reported() {
+        let tf = file("slug, repo");
+        assert_eq!(tf.warnings().len(), 1, "{:?}", tf.warnings());
+    }
+
+    #[test]
+    fn a_well_formed_declaration_warns_about_nothing() {
+        assert!(file("slug repo").warnings().is_empty());
+        assert!(file("slug *rest").warnings().is_empty());
+        assert!(file("slug msg='hello world'").warnings().is_empty());
+        assert!(file("_private").warnings().is_empty());
+    }
+
+    #[test]
+    fn validity_is_the_shell_identifier_rule() {
+        let valid = |name: &str| {
+            Arg {
+                name: name.into(),
+                variadic: false,
+                default: None,
+            }
+            .is_valid_name()
+        };
+        assert!(valid("slug"));
+        assert!(valid("_slug"));
+        assert!(valid("slug2"));
+        assert!(!valid("slug,"));
+        assert!(!valid("2slug"), "a leading digit is not an identifier");
+        assert!(!valid("my-slug"), "a hyphen is not an identifier");
+        assert!(!valid(""));
+    }
+
+    /// The variadic and default markers are stripped before the name is judged,
+    /// so a valid one must not be reported as broken.
+    #[test]
+    fn markers_are_not_part_of_the_name() {
+        assert!(file("*rest").warnings().is_empty());
+        assert!(file("name='a, b'").warnings().is_empty());
     }
 }
