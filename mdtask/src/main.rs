@@ -52,7 +52,7 @@ Usage:
 ";
 
 fn main() -> ExitCode {
-    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     // --watch: re-run on file change
     #[cfg(feature = "watch")]
@@ -77,7 +77,9 @@ fn main() -> ExitCode {
             "--watch" => {
                 i += 1;
             }
-            "--parallel" => { i += 1; }
+            "--parallel" => {
+                i += 1;
+            }
             "--dry-run" => {
                 i += 1;
             }
@@ -420,10 +422,10 @@ fn list(files: &[(PathBuf, TaskFile)], tag: Option<&str>) -> ExitCode {
         for job in tf.jobs() {
             if seen.insert(job.name.clone()) {
                 // Filter by tag if specified
-                if let Some(tag) = tag {
-                    if !job.tags.iter().any(|t| t == tag) {
-                        continue;
-                    }
+                if let Some(tag) = tag
+                    && !job.tags.iter().any(|t| t == tag)
+                {
+                    continue;
                 }
                 let args = usage(job);
                 let sep = if args.is_empty() { "" } else { " " };

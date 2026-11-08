@@ -41,4 +41,4 @@ pub use cancel::Cancel;
 pub use discover::find_task_files;
 pub use model::{Arg, DepError, Job, MissingArg, Requirement, RunError, TaskFile};
 pub use parse::parse;
-pub use run::{agent_jobs, run, run_parallel, run_agent, run_agent_cancellable, run_captured};
+pub use run::{agent_jobs, run, run_agent, run_agent_cancellable, run_captured, run_parallel};

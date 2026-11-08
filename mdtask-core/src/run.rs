@@ -205,7 +205,8 @@ fn run_inner(
         // Wave N: invocations whose deps are all in previous waves.
         let mut waves: Vec<Vec<usize>> = Vec::new();
         let mut assigned: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let mut name_to_idx: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut name_to_idx: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for (i, inv) in plan.iter().enumerate() {
             name_to_idx.insert(inv.task.clone(), i);
         }
@@ -261,10 +262,13 @@ fn run_inner(
                 // Run concurrently using threads
                 let mut results: Vec<Result<std::process::ExitStatus, RunError>> = Vec::new();
                 std::thread::scope(|s| {
-                    let handles: Vec<_> = wave.iter().map(|&i| {
-                        let inv = &plan[i];
-                        s.spawn(move || inv.run_inherit().map_err(|e| inv.spawn_error(e)))
-                    }).collect();
+                    let handles: Vec<_> = wave
+                        .iter()
+                        .map(|&i| {
+                            let inv = &plan[i];
+                            s.spawn(move || inv.run_inherit().map_err(|e| inv.spawn_error(e)))
+                        })
+                        .collect();
                     for h in handles {
                         results.push(h.join().unwrap());
                     }
