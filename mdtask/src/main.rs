@@ -291,12 +291,10 @@ fn main() -> ExitCode {
     // the layered files, then run each step (inheriting stdio), stopping on the
     // first non-zero exit.
     #[cfg(feature = "watch")]
-    if watch {
-        if let Some(name) = args.first().cloned() {
-            let positional: Vec<String> = args.iter().skip(1).cloned().collect();
-            watch_loop(&files, &name, &positional, &cwd);
-            return ExitCode::SUCCESS;
-        }
+    if watch && let Some(name) = args.first().cloned() {
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        watch_loop(&files, &name, &positional, &cwd);
+        return ExitCode::SUCCESS;
     }
 
     // If --output is specified, capture output to file
