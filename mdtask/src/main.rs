@@ -846,6 +846,7 @@ mod tests {
 }
 
 #[cfg(feature = "watch")]
+#[allow(clippy::items_after_test_module)]
 fn watch_loop(files: &[(PathBuf, TaskFile)], name: &str, positional: &[String], cwd: &Path) {
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
     use std::sync::mpsc;
