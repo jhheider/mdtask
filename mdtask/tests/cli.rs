@@ -138,3 +138,38 @@ fn the_mcp_server_stays_responsive_and_cancellation_reaches_the_work() {
     std::fs::remove_dir_all(&dir).ok();
     assert!(!leaked, "the cancelled task's grandchild kept running");
 }
+
+#[test]
+fn dry_run_prints_would_run() {
+    let dir = std::env::temp_dir().join(format!("mdtask-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("tasks.md");
+    std::fs::write(&md, "## build\n\n```sh\necho hi\n```\n").unwrap();
+    let out = mdtask()
+        .arg("--dry-run")
+        .arg("build")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Would run: build"), "missing Would run");
+}
+
+#[test]
+fn tag_filter_lists_only_tagged_tasks() {
+    let dir = std::env::temp_dir().join(format!("mdtask-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let md = dir.join("tasks.md");
+    std::fs::write(&md, "## build\nTags: ci\n\n```sh\necho hi\n```\n\n## lint\n\n```sh\necho lint\n```\n").unwrap();
+    let out = mdtask()
+        .arg("--tag")
+        .arg("ci")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("build"), "missing build");
+    assert!(!stdout.contains("lint"), "lint should be filtered");
+}
