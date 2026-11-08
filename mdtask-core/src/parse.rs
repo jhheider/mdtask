@@ -480,6 +480,12 @@ fn apply_line(
                 }
                 return true;
             }
+            "tags" => {
+                if let Some(t) = job {
+                    t.tags = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
+                return true;
+            }
             other => {
                 // A near-miss of a real key is a typo, not prose. `Arg:`,
                 // `Require:` and `Opt:` all used to vanish into the description

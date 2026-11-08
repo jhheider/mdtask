@@ -61,6 +61,9 @@ fn main() -> ExitCode {
     // --dry-run: validate and print without executing
     let dry_run = raw_args.iter().any(|a| a == "--dry-run");
 
+    // --tag NAME: filter tasks by tag
+    let mut tag_filter: Option<String> = None;
+
     // --output FILE: tee output to file
     let mut output_file: Option<String> = None;
     let mut quiet = false;
@@ -73,6 +76,14 @@ fn main() -> ExitCode {
             }
             "--dry-run" => {
                 i += 1;
+            }
+            "--tag" => {
+                if i + 1 < raw_args.len() {
+                    tag_filter = Some(raw_args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             "--output" => {
                 if i + 1 < raw_args.len() {
@@ -235,7 +246,7 @@ fn main() -> ExitCode {
     }
 
     let Some(name) = args.first().cloned() else {
-        return list(&files);
+        return list(&files, tag_filter.as_deref());
     };
 
     // The `mcp` subcommand serves the agent-allowed tasks over stdio, but only
@@ -353,13 +364,19 @@ fn run_mcp(_files: &[(PathBuf, TaskFile)]) -> ExitCode {
 /// Neither shape truncates. The description used to be cut at its first physical
 /// line, which in a hard-wrapped markdown paragraph is not a sentence, or even a
 /// clause: listings ended mid-phrase on "One license only permits one".
-fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
+fn list(files: &[(PathBuf, TaskFile)], tag: Option<&str>) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
     let mut groups: Vec<(&Path, Vec<(String, String)>)> = Vec::new();
     for (path, tf) in files {
         let mut rows = Vec::new();
         for job in tf.jobs() {
             if seen.insert(job.name.clone()) {
+                // Filter by tag if specified
+                if let Some(tag) = tag {
+                    if !job.tags.iter().any(|t| t == tag) {
+                        continue;
+                    }
+                }
                 let args = usage(job);
                 let sep = if args.is_empty() { "" } else { " " };
                 rows.push((

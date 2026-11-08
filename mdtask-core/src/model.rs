@@ -65,6 +65,8 @@ pub struct Job {
     /// [`run`] or [`run_captured`] ignores it. It stays public as advisory data an
     /// embedder can read.
     pub agent_allow: bool,
+    /// Tags for grouping/filtering tasks. Set via `Tags: ci, dev`.
+    pub tags: Vec<String>,
     /// The fenced block's info-string language (`sh`, `zsh`, `python`, ...); empty
     /// means an unlabeled fence (treated as `sh`).
     pub(crate) lang: String,
