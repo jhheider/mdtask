@@ -141,7 +141,7 @@ fn the_mcp_server_stays_responsive_and_cancellation_reaches_the_work() {
 
 #[test]
 fn dry_run_prints_would_run() {
-    let dir = std::env::temp_dir().join(format!("mdtask-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mdtask-test-dryrun-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let md = dir.join("tasks.md");
     std::fs::write(&md, "## build\n\n```sh\necho hi\n```\n").unwrap();
@@ -158,7 +158,7 @@ fn dry_run_prints_would_run() {
 
 #[test]
 fn tag_filter_lists_only_tagged_tasks() {
-    let dir = std::env::temp_dir().join(format!("mdtask-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mdtask-test-tag-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let md = dir.join("tasks.md");
     std::fs::write(
