@@ -293,6 +293,34 @@ fn main() -> ExitCode {
         }
     }
 
+    // If --output is specified, capture output to file
+    if let Some(out_path) = &output_file {
+        let name = args.first().cloned().unwrap_or_default();
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        match mdtask_core::run_captured(&files, &name, &positional, &cwd) {
+            Ok(output) => {
+                let _ = std::fs::write(out_path, &output.stdout);
+                let _ = std::fs::write(format!("{}.stderr", out_path), &output.stderr);
+                if !quiet {
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &output.stdout);
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+                }
+                if output.status.success() {
+                    return ExitCode::SUCCESS;
+                } else {
+                    let code = u8::try_from(output.status.code().unwrap_or(1))
+                        .unwrap_or(1)
+                        .max(1);
+                    return ExitCode::from(code);
+                }
+            }
+            Err(e) => {
+                report(&files, &name, &e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     match mdtask_core::run(&files, &name, &positional, &cwd) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         // A failing child: surface a non-zero code. `code()` can exceed 255

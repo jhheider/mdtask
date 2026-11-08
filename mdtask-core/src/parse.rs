@@ -482,7 +482,11 @@ fn apply_line(
             }
             "tags" => {
                 if let Some(t) = job {
-                    t.tags = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    t.tags = value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
                 return true;
             }
