@@ -65,6 +65,8 @@ pub struct Job {
     /// [`run`] or [`run_captured`] ignores it. It stays public as advisory data an
     /// embedder can read.
     pub agent_allow: bool,
+    /// Tags for grouping/filtering tasks. Set via `Tags: ci, dev`.
+    pub tags: Vec<String>,
     /// The fenced block's info-string language (`sh`, `zsh`, `python`, ...); empty
     /// means an unlabeled fence (treated as `sh`).
     pub(crate) lang: String,
@@ -444,6 +446,26 @@ impl TaskFile {
         // Env precedence: hoisted, then job, then args. Args win, being the most
         // specific, so `$name` resolves to the passed value.
         let mut env = self.env.clone();
+
+        // Load .env file from the working directory (if present)
+        let env_file_path = cwd.join(".env");
+        if let Ok(content) = std::fs::read_to_string(&env_file_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    // Don't override explicitly set env vars
+                    if !env.iter().any(|(k, _)| k == key) {
+                        env.push((key.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
+
         env.extend(job.env.iter().cloned());
         env.extend(effective.iter().map(|(k, v)| (k.clone(), v.clone())));
 

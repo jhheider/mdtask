@@ -91,6 +91,7 @@ pub(crate) fn dependency_order(
                 order.push(Step {
                     name: frame.name,
                     args: frame.args,
+                    deps: frame.deps.iter().map(|r| r.name.clone()).collect(),
                 });
             }
         }
@@ -105,6 +106,8 @@ pub(crate) fn dependency_order(
 pub(crate) struct Step {
     pub(crate) name: String,
     pub(crate) args: Vec<String>,
+    /// Names of direct dependencies (for parallel wave grouping).
+    pub(crate) deps: Vec<String>,
 }
 
 #[cfg(test)]

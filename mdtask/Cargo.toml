@@ -1,6 +1,6 @@
 [package]
 name = "mdtask"
-version = "0.6.1"
+version = "0.7.0"
 description = "Run tasks defined in markdown: mdtask <name> [args]. A thin CLI over mdtask-core."
 keywords = ["task", "runner", "markdown", "cli"]
 categories = ["development-tools", "command-line-utilities"]
@@ -13,11 +13,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-mdtask-core = { version = "0.6", path = "../mdtask-core" }
+mdtask-core = { version = "0.7", path = "../mdtask-core" }
 serde_json = { version = "1", optional = true }
+notify = { version = "6", optional = true }
 
 [features]
 mcp = ["dep:serde_json"]
+watch = ["dep:notify"]
 
 # rust-ci's release.yml ships assets as `mdtask-{os}-{arch}.{ext}` (no version,
 # no full target triple), which matches none of binstall's default guess

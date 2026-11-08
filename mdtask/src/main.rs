@@ -52,7 +52,64 @@ Usage:
 ";
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // --watch: re-run on file change
+    #[cfg(feature = "watch")]
+    let watch = raw_args.iter().any(|a| a == "--watch");
+
+    // --parallel: run independent deps concurrently
+    let parallel = raw_args.iter().any(|a| a == "--parallel");
+
+    // --dry-run: validate and print without executing
+    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
+
+    // --tag NAME: filter tasks by tag
+    let mut tag_filter: Option<String> = None;
+
+    // --output FILE: tee output to file
+    let mut output_file: Option<String> = None;
+    let mut quiet = false;
+    let mut filtered_args = Vec::new();
+    let mut i = 0;
+    while i < raw_args.len() {
+        match raw_args[i].as_str() {
+            "--watch" => {
+                i += 1;
+            }
+            "--parallel" => {
+                i += 1;
+            }
+            "--dry-run" => {
+                i += 1;
+            }
+            "--tag" => {
+                if i + 1 < raw_args.len() {
+                    tag_filter = Some(raw_args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--output" => {
+                if i + 1 < raw_args.len() {
+                    output_file = Some(raw_args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
+            _ => {
+                filtered_args.push(raw_args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let mut args = filtered_args;
 
     // Version/help are recognised only in the first (subcommand) position, so
     // `mdtask <task> --help` still forwards `--help` to the task.
@@ -148,8 +205,54 @@ fn main() -> ExitCode {
         return show(&files, &name);
     }
 
+    // --dry-run: validate and print without executing
+    if dry_run {
+        let Some(name) = args.first().cloned() else {
+            eprintln!("mdtask: --dry-run needs a task name");
+            return ExitCode::FAILURE;
+        };
+        if let Some(job) = job_named(&files, &name) {
+            println!("Would run: {}", name);
+            if !job.args.is_empty() {
+                println!(
+                    "  Args: {}",
+                    job.args
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if !job.requires.is_empty() {
+                println!(
+                    "  Requires: {}",
+                    job.requires
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let env_pairs = job.env();
+            if !env_pairs.is_empty() {
+                println!(
+                    "  Env: {}",
+                    env_pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            return ExitCode::SUCCESS;
+        } else {
+            eprintln!("mdtask: no task named {name:?}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let Some(name) = args.first().cloned() else {
-        return list(&files);
+        return list(&files, tag_filter.as_deref());
     };
 
     // The `mcp` subcommand serves the agent-allowed tasks over stdio, but only
@@ -187,6 +290,57 @@ fn main() -> ExitCode {
     // Core owns the whole run: resolve the target and its `Requires:` chain across
     // the layered files, then run each step (inheriting stdio), stopping on the
     // first non-zero exit.
+    #[cfg(feature = "watch")]
+    if watch && let Some(name) = args.first().cloned() {
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        watch_loop(&files, &name, &positional, &cwd);
+        return ExitCode::SUCCESS;
+    }
+
+    // If --output is specified, capture output to file
+    if let Some(out_path) = &output_file {
+        let name = args.first().cloned().unwrap_or_default();
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        match mdtask_core::run_captured(&files, &name, &positional, &cwd) {
+            Ok(output) => {
+                let _ = std::fs::write(out_path, &output.stdout);
+                let _ = std::fs::write(format!("{}.stderr", out_path), &output.stderr);
+                if !quiet {
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &output.stdout);
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+                }
+                if output.status.success() {
+                    return ExitCode::SUCCESS;
+                } else {
+                    let code = u8::try_from(output.status.code().unwrap_or(1))
+                        .unwrap_or(1)
+                        .max(1);
+                    return ExitCode::from(code);
+                }
+            }
+            Err(e) => {
+                report(&files, &name, &e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if parallel {
+        let name = args.first().cloned().unwrap_or_default();
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        match mdtask_core::run_parallel(&files, &name, &positional, &cwd) {
+            Ok(status) if status.success() => return ExitCode::SUCCESS,
+            Ok(status) => {
+                let code = u8::try_from(status.code().unwrap_or(1)).unwrap_or(1).max(1);
+                return ExitCode::from(code);
+            }
+            Err(e) => {
+                report(&files, &name, &e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     match mdtask_core::run(&files, &name, &positional, &cwd) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         // A failing child: surface a non-zero code. `code()` can exceed 255
@@ -258,13 +412,19 @@ fn run_mcp(_files: &[(PathBuf, TaskFile)]) -> ExitCode {
 /// Neither shape truncates. The description used to be cut at its first physical
 /// line, which in a hard-wrapped markdown paragraph is not a sentence, or even a
 /// clause: listings ended mid-phrase on "One license only permits one".
-fn list(files: &[(PathBuf, TaskFile)]) -> ExitCode {
+fn list(files: &[(PathBuf, TaskFile)], tag: Option<&str>) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
     let mut groups: Vec<(&Path, Vec<(String, String)>)> = Vec::new();
     for (path, tf) in files {
         let mut rows = Vec::new();
         for job in tf.jobs() {
             if seen.insert(job.name.clone()) {
+                // Filter by tag if specified
+                if let Some(tag) = tag
+                    && !job.tags.iter().any(|t| t == tag)
+                {
+                    continue;
+                }
                 let args = usage(job);
                 let sep = if args.is_empty() { "" } else { " " };
                 rows.push((
@@ -682,5 +842,44 @@ mod tests {
         unsafe { std::env::set_var("COLUMNS", "120") };
         assert_eq!(terminal_width(), 120);
         unsafe { std::env::remove_var("COLUMNS") };
+    }
+}
+
+#[cfg(feature = "watch")]
+#[allow(clippy::items_after_test_module)]
+fn watch_loop(files: &[(PathBuf, TaskFile)], name: &str, positional: &[String], cwd: &Path) {
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+    let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("mdtask: failed to create file watcher: {e}");
+            return;
+        }
+    };
+
+    for (path, _) in files {
+        let _ = watcher.watch(path, RecursiveMode::NonRecursive);
+    }
+
+    // Run once
+    let _ = mdtask_core::run(files, name, positional, cwd);
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(event)) => {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    eprintln!("mdtask: file changed, re-running...");
+                    let _ = mdtask_core::run(files, name, positional, cwd);
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("mdtask: watch error: {e}");
+            }
+            Err(_) => break,
+        }
     }
 }
