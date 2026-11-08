@@ -161,7 +161,11 @@ fn tag_filter_lists_only_tagged_tasks() {
     let dir = std::env::temp_dir().join(format!("mdtask-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let md = dir.join("tasks.md");
-    std::fs::write(&md, "## build\nTags: ci\n\n```sh\necho hi\n```\n\n## lint\n\n```sh\necho lint\n```\n").unwrap();
+    std::fs::write(
+        &md,
+        "## build\nTags: ci\n\n```sh\necho hi\n```\n\n## lint\n\n```sh\necho lint\n```\n",
+    )
+    .unwrap();
     let out = mdtask()
         .arg("--tag")
         .arg("ci")
