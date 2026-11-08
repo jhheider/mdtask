@@ -54,6 +54,10 @@ Usage:
 fn main() -> ExitCode {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
 
+    // --watch: re-run on file change
+    #[cfg(feature = "watch")]
+    let watch = raw_args.iter().any(|a| a == "--watch");
+
     // --dry-run: validate and print without executing
     let dry_run = raw_args.iter().any(|a| a == "--dry-run");
 
@@ -64,17 +68,28 @@ fn main() -> ExitCode {
     let mut i = 0;
     while i < raw_args.len() {
         match raw_args[i].as_str() {
-            "--dry-run" => { i += 1; }
+            "--watch" => {
+                i += 1;
+            }
+            "--dry-run" => {
+                i += 1;
+            }
             "--output" => {
                 if i + 1 < raw_args.len() {
-                    output_file = Some(raw_args[i+1].clone());
+                    output_file = Some(raw_args[i + 1].clone());
                     i += 2;
                 } else {
                     i += 1;
                 }
             }
-            "--quiet" => { quiet = true; i += 1; }
-            _ => { filtered_args.push(raw_args[i].clone()); i += 1; }
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
+            _ => {
+                filtered_args.push(raw_args[i].clone());
+                i += 1;
+            }
         }
     }
     let mut args = filtered_args;
@@ -182,14 +197,35 @@ fn main() -> ExitCode {
         if let Some(job) = job_named(&files, &name) {
             println!("Would run: {}", name);
             if !job.args.is_empty() {
-                println!("  Args: {}", job.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "));
+                println!(
+                    "  Args: {}",
+                    job.args
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             if !job.requires.is_empty() {
-                println!("  Requires: {}", job.requires.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", "));
+                println!(
+                    "  Requires: {}",
+                    job.requires
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             let env_pairs = job.env();
             if !env_pairs.is_empty() {
-                println!("  Env: {}", env_pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", "));
+                println!(
+                    "  Env: {}",
+                    env_pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             return ExitCode::SUCCESS;
         } else {
@@ -237,6 +273,15 @@ fn main() -> ExitCode {
     // Core owns the whole run: resolve the target and its `Requires:` chain across
     // the layered files, then run each step (inheriting stdio), stopping on the
     // first non-zero exit.
+    #[cfg(feature = "watch")]
+    if watch {
+        if let Some(name) = args.first().cloned() {
+            let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+            watch_loop(&files, &name, &positional, &cwd);
+            return ExitCode::SUCCESS;
+        }
+    }
+
     match mdtask_core::run(&files, &name, &positional, &cwd) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         // A failing child: surface a non-zero code. `code()` can exceed 255
@@ -732,5 +777,43 @@ mod tests {
         unsafe { std::env::set_var("COLUMNS", "120") };
         assert_eq!(terminal_width(), 120);
         unsafe { std::env::remove_var("COLUMNS") };
+    }
+}
+
+#[cfg(feature = "watch")]
+fn watch_loop(files: &[(PathBuf, TaskFile)], name: &str, positional: &[String], cwd: &Path) {
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+    let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("mdtask: failed to create file watcher: {e}");
+            return;
+        }
+    };
+
+    for (path, _) in files {
+        let _ = watcher.watch(path, RecursiveMode::NonRecursive);
+    }
+
+    // Run once
+    let _ = mdtask_core::run(files, name, positional, cwd);
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(event)) => {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    eprintln!("mdtask: file changed, re-running...");
+                    let _ = mdtask_core::run(files, name, positional, cwd);
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("mdtask: watch error: {e}");
+            }
+            Err(_) => break,
+        }
     }
 }
