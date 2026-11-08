@@ -176,9 +176,111 @@ pub fn run(
     args: &[String],
     cwd: &Path,
 ) -> Result<std::process::ExitStatus, RunError> {
+    run_inner(files, name, args, cwd, false)
+}
+
+pub fn run_parallel(
+    files: &[(PathBuf, TaskFile)],
+    name: &str,
+    args: &[String],
+    cwd: &Path,
+) -> Result<std::process::ExitStatus, RunError> {
+    run_inner(files, name, args, cwd, true)
+}
+
+fn run_inner(
+    files: &[(PathBuf, TaskFile)],
+    name: &str,
+    args: &[String],
+    cwd: &Path,
+    parallel: bool,
+) -> Result<std::process::ExitStatus, RunError> {
     let order = trusted_order(files, name)?;
     let plan = plan_invocations(&order, name, args, cwd, |n| trusted_lookup(files, n))?;
     let mut last = None;
+
+    if parallel && plan.len() > 1 {
+        // Group invocations into waves based on dependency order.
+        // Wave 0: invocations with no deps (or deps not in the plan).
+        // Wave N: invocations whose deps are all in previous waves.
+        let mut waves: Vec<Vec<usize>> = Vec::new();
+        let mut assigned: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut name_to_idx: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for (i, inv) in plan.iter().enumerate() {
+            name_to_idx.insert(inv.task.clone(), i);
+        }
+
+        while assigned.len() < plan.len() {
+            let mut wave = Vec::new();
+            for (i, _inv) in plan.iter().enumerate() {
+                if assigned.contains(&i) {
+                    continue;
+                }
+                // Check if all deps are in previous waves (assigned)
+                let deps = &order[i].deps;
+                let deps_done = deps.iter().all(|d| {
+                    // dep is done if it's not in the plan (external) or already assigned
+                    !name_to_idx.contains_key(d) || assigned.contains(name_to_idx.get(d).unwrap())
+                });
+                if deps_done {
+                    wave.push(i);
+                }
+            }
+            if wave.is_empty() {
+                // Cycle or unresolvable - fall back to sequential
+                break;
+            }
+            for &i in &wave {
+                assigned.insert(i);
+            }
+            waves.push(wave);
+        }
+
+        // If we couldn't form waves (cycle), fall back to sequential
+        if assigned.len() < plan.len() {
+            for inv in &plan {
+                let status = inv.run_inherit().map_err(|e| inv.spawn_error(e))?;
+                if !status.success() {
+                    return Ok(status);
+                }
+                last = Some(status);
+            }
+            return Ok(last.expect("the plan always contains the target"));
+        }
+
+        // Execute waves concurrently
+        for wave in &waves {
+            if wave.len() == 1 {
+                let inv = &plan[wave[0]];
+                let status = inv.run_inherit().map_err(|e| inv.spawn_error(e))?;
+                if !status.success() {
+                    return Ok(status);
+                }
+                last = Some(status);
+            } else {
+                // Run concurrently using threads
+                let mut results: Vec<Result<std::process::ExitStatus, RunError>> = Vec::new();
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = wave.iter().map(|&i| {
+                        let inv = &plan[i];
+                        s.spawn(move || inv.run_inherit().map_err(|e| inv.spawn_error(e)))
+                    }).collect();
+                    for h in handles {
+                        results.push(h.join().unwrap());
+                    }
+                });
+                for result in results {
+                    let status = result?;
+                    if !status.success() {
+                        return Ok(status);
+                    }
+                    last = Some(status);
+                }
+            }
+        }
+        return Ok(last.expect("the plan always contains the target"));
+    }
+
     for inv in &plan {
         let status = inv.run_inherit().map_err(|e| inv.spawn_error(e))?;
         if !status.success() {

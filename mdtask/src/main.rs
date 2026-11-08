@@ -58,6 +58,9 @@ fn main() -> ExitCode {
     #[cfg(feature = "watch")]
     let watch = raw_args.iter().any(|a| a == "--watch");
 
+    // --parallel: run independent deps concurrently
+    let parallel = raw_args.iter().any(|a| a == "--parallel");
+
     // --dry-run: validate and print without executing
     let dry_run = raw_args.iter().any(|a| a == "--dry-run");
 
@@ -74,6 +77,7 @@ fn main() -> ExitCode {
             "--watch" => {
                 i += 1;
             }
+            "--parallel" => { i += 1; }
             "--dry-run" => {
                 i += 1;
             }
@@ -313,6 +317,22 @@ fn main() -> ExitCode {
                         .max(1);
                     return ExitCode::from(code);
                 }
+            }
+            Err(e) => {
+                report(&files, &name, &e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if parallel {
+        let name = args.first().cloned().unwrap_or_default();
+        let positional: Vec<String> = args.iter().skip(1).cloned().collect();
+        match mdtask_core::run_parallel(&files, &name, &positional, &cwd) {
+            Ok(status) if status.success() => return ExitCode::SUCCESS,
+            Ok(status) => {
+                let code = u8::try_from(status.code().unwrap_or(1)).unwrap_or(1).max(1);
+                return ExitCode::from(code);
             }
             Err(e) => {
                 report(&files, &name, &e);
