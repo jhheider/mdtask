@@ -52,7 +52,32 @@ Usage:
 ";
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // --dry-run: validate and print without executing
+    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
+
+    // --output FILE: tee output to file
+    let mut output_file: Option<String> = None;
+    let mut quiet = false;
+    let mut filtered_args = Vec::new();
+    let mut i = 0;
+    while i < raw_args.len() {
+        match raw_args[i].as_str() {
+            "--dry-run" => { i += 1; }
+            "--output" => {
+                if i + 1 < raw_args.len() {
+                    output_file = Some(raw_args[i+1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--quiet" => { quiet = true; i += 1; }
+            _ => { filtered_args.push(raw_args[i].clone()); i += 1; }
+        }
+    }
+    let mut args = filtered_args;
 
     // Version/help are recognised only in the first (subcommand) position, so
     // `mdtask <task> --help` still forwards `--help` to the task.
@@ -146,6 +171,31 @@ fn main() -> ExitCode {
 
     if let Some(name) = show_name {
         return show(&files, &name);
+    }
+
+    // --dry-run: validate and print without executing
+    if dry_run {
+        let Some(name) = args.first().cloned() else {
+            eprintln!("mdtask: --dry-run needs a task name");
+            return ExitCode::FAILURE;
+        };
+        if let Some(job) = job_named(&files, &name) {
+            println!("Would run: {}", name);
+            if !job.args.is_empty() {
+                println!("  Args: {}", job.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            if !job.requires.is_empty() {
+                println!("  Requires: {}", job.requires.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            let env_pairs = job.env();
+            if !env_pairs.is_empty() {
+                println!("  Env: {}", env_pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", "));
+            }
+            return ExitCode::SUCCESS;
+        } else {
+            eprintln!("mdtask: no task named {name:?}");
+            return ExitCode::FAILURE;
+        }
     }
 
     let Some(name) = args.first().cloned() else {
